@@ -26,12 +26,81 @@
 #include <linux/hrtimer.h>
 #include <linux/of.h>
 #include <linux/pm_qos.h>
+#include <linux/moduleparam.h>
+#include <linux/string.h>
+#include <linux/atomic.h>
 #include "governor.h"
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/devfreq.h>
 
 #define HZ_PER_KHZ	1000
+
+/*
+ * Dynamic gaming GPU frequency floor (Vorpal coupling).
+ *
+ * Hold GPU-class devfreq devices at or above this percent of their max
+ * frequency, but ONLY during the short render-pressure windows the Vorpal
+ * cpufreq governor signals via vorpal_gpu_boost_until_ns (a ktime deadline it
+ * arms when frames are sagging or rendering has just resumed after a pause).
+ * That is exactly the bursty asset-streaming phase - e.g. the first minutes of a
+ * match - where the GPU keeps idling between bursts and pays a ramp-up latency on
+ * each new heavy frame, producing stutter. Holding a floor during those windows
+ * keeps the GPU ready; once frames are smooth again the window lapses and the GPU
+ * is free to idle, so steady-state stays cool (no sustained-heat / late-throttle
+ * cost of a static floor).
+ *
+ * Universal by construction: it acts in the devfreq core's frequency-range
+ * computation, which every devfreq-based GPU (Mali, Adreno/kgsl, ...) goes
+ * through regardless of which vendor module registered it. It only RAISES the
+ * minimum (never the max). vorpal_gpu_boost_until_ns is owned here (always built)
+ * and written by the governor when present, so there is no build-order
+ * dependency; if no governor writes it the floor simply never engages.
+ * Runtime-tunable at /sys/module/devfreq/parameters/gaming_gpu_floor_pct. A
+ * second, stronger floor is available for short hard-pressure windows (real
+ * frame sag/jank or render resume). Both are only minimum-frequency floors,
+ * never caps, and only apply while Vorpal's deadline is live.
+ */
+atomic64_t vorpal_gpu_boost_until_ns = ATOMIC64_INIT(0);
+EXPORT_SYMBOL_GPL(vorpal_gpu_boost_until_ns);
+atomic64_t vorpal_gpu_hard_boost_until_ns = ATOMIC64_INIT(0);
+EXPORT_SYMBOL_GPL(vorpal_gpu_hard_boost_until_ns);
+/*
+ * Cold-start / render-resume launch window. The governor arms this across the
+ * whole bursty asset-streaming phase of a match spawn (1-3s). During it the GPU
+ * is held at gaming_gpu_launch_floor_pct - higher than the reactive soft floor -
+ * so the slow-ramping GPU is already up when the first heavy frames stream in,
+ * killing the "loads then jitters, fps dips at spawn" stutter. Time-bounded by
+ * the governor to well under its CPU warmup, so it adds no steady-state heat.
+ */
+atomic64_t vorpal_gpu_launch_until_ns = ATOMIC64_INIT(0);
+EXPORT_SYMBOL_GPL(vorpal_gpu_launch_until_ns);
+static int gaming_gpu_floor_pct = 50;
+static int gaming_gpu_hard_floor_pct = 66;
+static int gaming_gpu_launch_floor_pct = 60;
+module_param(gaming_gpu_floor_pct, int, 0644);
+MODULE_PARM_DESC(gaming_gpu_floor_pct,
+		 "Vorpal gaming: soft GPU devfreq min-freq floor percent of max (0=all floors off)");
+module_param(gaming_gpu_hard_floor_pct, int, 0644);
+MODULE_PARM_DESC(gaming_gpu_hard_floor_pct,
+		 "Vorpal gaming: hard GPU devfreq min-freq floor percent of max");
+module_param(gaming_gpu_launch_floor_pct, int, 0644);
+MODULE_PARM_DESC(gaming_gpu_launch_floor_pct,
+		 "Vorpal gaming: cold-start GPU devfreq min-freq floor percent of max");
+
+/* Identify a GPU-class devfreq device by its parent device name. */
+static bool devfreq_is_gpu(struct devfreq *devfreq)
+{
+	const char *name;
+
+	if (!devfreq->dev.parent)
+		return false;
+	name = dev_name(devfreq->dev.parent);
+	if (!name)
+		return false;
+
+	return strstr(name, "gpu") || strstr(name, "kgsl") || strstr(name, "mali");
+}
 
 static struct class *devfreq_class;
 static struct dentry *devfreq_debugfs;
@@ -151,6 +220,41 @@ static void get_freq_range(struct devfreq *devfreq,
 	/* Apply constraints from OPP interface */
 	*min_freq = max(*min_freq, devfreq->scaling_min_freq);
 	*max_freq = min(*max_freq, devfreq->scaling_max_freq);
+
+	/*
+	 * Dynamic Vorpal gaming GPU floor: raise the minimum of GPU-class devices
+	 * only while the governor signals a render-pressure window (frames sagging
+	 * / rendering just resumed), so the GPU is ready through the bursty phase
+	 * but free to idle when frames are smooth. Bounded to [.., *max_freq];
+	 * only ever lifts the minimum.
+	 */
+	if (gaming_gpu_floor_pct > 0 && devfreq_is_gpu(devfreq)) {
+		u64 until = (u64)atomic64_read(&vorpal_gpu_boost_until_ns);
+		u64 hard_until =
+			(u64)atomic64_read(&vorpal_gpu_hard_boost_until_ns);
+		u64 launch_until =
+			(u64)atomic64_read(&vorpal_gpu_launch_until_ns);
+		u64 now = ktime_get_ns();
+		bool hard = hard_until && now < hard_until;
+		bool launch = launch_until && now < launch_until;
+
+		if ((until && now < until) || hard || launch) {
+			int pct = clamp(gaming_gpu_floor_pct, 0, 100);
+			unsigned long floor;
+
+			/* Highest active window wins; each only ever lifts the min. */
+			if (launch)
+				pct = max(pct,
+					  clamp(gaming_gpu_launch_floor_pct, 0, 100));
+			if (hard)
+				pct = max(pct,
+					  clamp(gaming_gpu_hard_floor_pct, 0, 100));
+
+			floor = (unsigned long)((u64)*max_freq * pct / 100);
+
+			*min_freq = max(*min_freq, floor);
+		}
+	}
 
 	if (*min_freq > *max_freq)
 		*min_freq = *max_freq;

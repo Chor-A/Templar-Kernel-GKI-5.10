@@ -24,6 +24,7 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#include <linux/atomic.h>
 #include <linux/export.h>
 #include <linux/kthread.h>
 #include <linux/moduleparam.h>
@@ -38,6 +39,21 @@
 
 #include "drm_internal.h"
 #include "drm_trace.h"
+
+/*
+ * Frame-present feed for the Vorpal cpufreq governor's built-in frame pacing
+ * (KMI-safe: new file-scope atomics, no struct change). Published only on
+ * DRM_EVENT_FLIP_COMPLETE - one delivered page flip = one presented frame -
+ * NOT on DRM_EVENT_VBLANK, which fires for plain vblank waiters at the panel
+ * refresh rate and would make the governor read panel cadence instead of the
+ * app's real present cadence. drm_present_seq increments once per present so
+ * the consumer can detect presents it missed between samples. DRM only
+ * publishes; it never depends on the governor.
+ */
+atomic64_t drm_last_present_ns = ATOMIC64_INIT(0);
+EXPORT_SYMBOL_GPL(drm_last_present_ns);
+atomic64_t drm_present_seq = ATOMIC64_INIT(0);
+EXPORT_SYMBOL_GPL(drm_present_seq);
 
 /**
  * DOC: vblank handling
@@ -983,6 +999,15 @@ static void send_vblank_event(struct drm_device *dev,
 	switch (e->event.base.type) {
 	case DRM_EVENT_VBLANK:
 	case DRM_EVENT_FLIP_COMPLETE:
+		/*
+		 * Publish the present time for Vorpal frame pacing on real flips
+		 * only (one delivered flip = one presented frame); a plain vblank
+		 * event is not a present.
+		 */
+		if (e->event.base.type == DRM_EVENT_FLIP_COMPLETE) {
+			atomic64_set(&drm_last_present_ns, ktime_to_ns(now));
+			atomic64_inc(&drm_present_seq);
+		}
 		tv = ktime_to_timespec64(now);
 		e->event.vbl.sequence = seq;
 		/*
@@ -2161,4 +2186,3 @@ err_free:
 	kfree(e);
 	return ret;
 }
-

@@ -102,8 +102,7 @@ unsigned int sysctl_sched_child_runs_first __read_mostly;
 int sched_gaming_active __read_mostly;
 EXPORT_SYMBOL_GPL(sched_gaming_active);
 
-#define GAMING_VRUNTIME_STRETCH         4
-#define GAMING_WAKEUP_GRANULARITY_NS    500000
+#define GAMING_WAKEUP_GRANULARITY_NS    300000
 
 
 /*
@@ -1050,13 +1049,17 @@ static void update_curr(struct cfs_rq *cfs_rq)
     update_burst_penalty(curr);
 #endif // CONFIG_SCHED_BORE
 
-/* Gaming mode: stretch vruntime for background tasks */
-        if (unlikely(sched_gaming_active && !entity_is_task(curr))) {
-                curr->vruntime += calc_delta_fair(delta_exec * (GAMING_VRUNTIME_STRETCH - 1), curr);
-        } else if (unlikely(sched_gaming_active && entity_is_task(curr) &&
-                            curr->avg.load_avg < 100)) {
-                curr->vruntime += calc_delta_fair(delta_exec, curr);
-        }
+	/*
+	 * Gaming mode: penalise only genuinely background TASKS (nice > 0).
+	 * Never touch non-task entities (cgroups) — the old code quadrupled
+	 * vruntime for the whole cgroup, starving every task inside including
+	 * the game's own render thread.  The load_avg < 100 clause is also
+	 * removed: it punished lightweight but latency-critical threads
+	 * (audio mixer, input reader) that happen to run briefly.
+	 */
+	if (unlikely(sched_gaming_active && entity_is_task(curr) &&
+		     task_of(curr)->static_prio > DEFAULT_PRIO))
+		curr->vruntime += calc_delta_fair(delta_exec, curr);
     update_min_vruntime(cfs_rq);
 
     if (entity_is_task(curr)) {
@@ -4761,14 +4764,19 @@ check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
 	ideal_runtime = sched_slice(cfs_rq, curr);
 	delta_exec = curr->sum_exec_runtime - curr->prev_sum_exec_runtime;
 	/*
-         * Gaming mode: reduce ideal runtime for background tasks
-         */
-        if (unlikely(sched_gaming_active)) {
-                struct task_struct *p = task_of(curr);
-                if (p->static_prio > DEFAULT_PRIO &&
-                    delta_exec > ideal_runtime / 2)
-                        resched_curr(rq_of(cfs_rq));
-        }
+	 * Gaming mode: preempt background tasks (nice >= 3) that have consumed
+	 * half of their slice. nice >= 3 protects game-support threads (audio,
+	 * input, SF helpers at nice 0-2) while cutting Android background
+	 * services (sync adapters, content providers, GMS at nice 3+) short.
+	 * The old nice >= 5 / 75% was too permissive, and the 2/3 slice still
+	 * let background bursts sit in front of wakeups during gaming.
+	 */
+	if (unlikely(sched_gaming_active && entity_is_task(curr))) {
+		struct task_struct *p = task_of(curr);
+		if (p->static_prio >= DEFAULT_PRIO + 3 &&
+		    delta_exec > (ideal_runtime >> 1))
+			resched_curr(rq_of(cfs_rq));
+	}
 	trace_android_rvh_check_preempt_tick(current, &ideal_runtime, &skip_preempt,
 			delta_exec, cfs_rq, curr, sysctl_sched_min_granularity);
 	if (skip_preempt)
@@ -5270,19 +5278,16 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
 		cfs_rq = cfs_rq_of(se);
 
 		/*
-		 * Gaming mode: nudge foreground (top-app) tasks to the front
-		 * of the runqueue so the render / game-logic threads schedule
-		 * with less wakeup latency. Foreground is approximated by
-		 * nice <= 0 (static_prio <= DEFAULT_PRIO), the symmetric
-		 * counterpart to the background demotion in check_preempt_tick.
-		 * Reads only, no struct change -> KMI safe. The old comm[]
-		 * string match was a scheduler-hotpath anti-pattern and the
-		 * prio < MAX_RT_PRIO test never fired for CFS tasks; both gone.
+		 * NOTE: a gaming "front-of-runqueue" vruntime nudge used to live
+		 * here, but this is unthrottle_cfs_rq() - a rare CFS-bandwidth
+		 * path that does NOT run on the normal render-thread wakeup, so it
+		 * never delivered the wakeup-latency benefit it claimed, while it
+		 * could transiently push a task's vruntime below cfs_rq->min_vruntime
+		 * (a fairness perturbation on an already-fragile post-throttle path).
+		 * Render-thread wakeup latency is handled effectively by the gaming
+		 * wakeup_gran shrink in wakeup_gran(), which runs on every wakeup
+		 * preemption decision. Removed -> reverts to stock behaviour here.
 		 */
-		if (unlikely(sched_gaming_active && entity_is_task(se) &&
-			     task_of(se)->static_prio <= DEFAULT_PRIO))
-			se->vruntime -= min_t(u64, se->vruntime, NSEC_PER_MSEC);
-
 		update_load_avg(cfs_rq, se, UPDATE_TG);
 		se_update_runnable(se);
 
@@ -7113,6 +7118,30 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu, int sy
 			if (!cpumask_test_cpu(cpu, p->cpus_ptr))
 				continue;
 
+			/*
+			 * Gaming render-placement bias. EAS anchors a task to its
+			 * prev_cpu and only migrates it off for a >=6% energy win, so a
+			 * heavy render / game-logic thread that once landed on a LITTLE
+			 * core stays pinned there (moving to Big/Prime "costs energy"),
+			 * saturating LITTLE while the perf clusters sit idle - the exact
+			 * frame-drop-without-throttle signature. While gaming, steer only a
+			 * GENUINELY heavy thread (util-est past ~45% of a full core - the
+			 * render / main / game-logic threads, not the many moderate support
+			 * threads) off the LITTLE cluster so it wakes onto Big/Prime where a
+			 * frame's critical path belongs. The high bar matters: a low
+			 * threshold would evacuate half of Android's moderate threads onto
+			 * the 4 perf cores, raising their residency and heat over a long
+			 * session (the opposite of race-to-idle) - so support work stays
+			 * free to pack onto LITTLE. If no perf CPU qualifies (all
+			 * overutilised or affinity-restricted to LITTLE) the loop leaves
+			 * best_energy_cpu at prev_cpu, so the fallthrough return is always a
+			 * valid CPU in p->cpus_ptr - no starvation. Reads only -> KMI-safe.
+			 */
+			if (sched_gaming_active &&
+			    task_util_est(p) > (SCHED_CAPACITY_SCALE * 45 / 100) &&
+			    capacity_orig_of(cpu) < (SCHED_CAPACITY_SCALE * 3 / 5))
+				continue;
+
 			util = cpu_util_next(cpu, p, cpu);
 			cpu_cap = capacity_of(cpu);
 			spare_cap = cpu_cap;
@@ -7381,6 +7410,14 @@ balance_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 static unsigned long wakeup_gran(struct sched_entity *se)
 {
 	unsigned long gran = sysctl_sched_wakeup_granularity;
+
+	/*
+	 * Gaming mode: shrink the wake-up granularity so a freshly woken
+	 * render / game thread preempts the current task sooner. Lower wake-up
+	 * latency on the render thread = fewer late frames = less micro-stutter.
+	 */
+	if (unlikely(sched_gaming_active) && gran > GAMING_WAKEUP_GRANULARITY_NS)
+		gran = GAMING_WAKEUP_GRANULARITY_NS;
 
 	/*
 	 * Since its curr running now, convert the gran from real-time
@@ -8025,16 +8062,29 @@ static int task_hot(struct task_struct *p, struct lb_env *env)
 	 * cache-hot window to cut lobby migration churn. This is a bias, not a
 	 * hard pin (active balance can still move it), and reads only - KMI-safe.
 	 *
-	 * Threshold is src_cap >> 3 (~12.5%): per-cluster CPU telemetry showed
+	 * Threshold is src_cap >> 4 (~6.25%): per-cluster CPU telemetry showed
 	 * render threads being demoted onto LITTLE (LITTLE saturating 60-90%
-	 * while PRIME sat near-idle), so the isolation now catches moderately
-	 * heavy threads, keeping them on Big/Prime where the work belongs.
+	 * while PRIME sat near-idle), so the isolation now catches lighter
+	 * render-adjacent bursts too, keeping them on Big/Prime where the work
+	 * belongs.
 	 */
 	if (sched_gaming_active) {
+		/*
+		 * Hybrid render isolation: keep a heavy thread (render / game
+		 * logic) off a smaller-capacity destination - demoting it to a
+		 * LITTLE core is a common frame-drop source. This is the ONLY
+		 * gaming bias here; light tasks fall through to the stock
+		 * cache-hot rule below so the load balancer can still pack them
+		 * onto LITTLE as usual.
+		 *
+		 * The previous `delta < migration_cost * 2` doubled the cache-hot
+		 * window for ALL tasks while gaming, which froze normal balancing
+		 * and let work pile up on whichever core it landed on (more heat,
+		 * the opposite of the hybrid race-to-idle goal). Dropped.
+		 */
 		if (capacity_orig_of(env->dst_cpu) < capacity_orig_of(env->src_cpu) &&
-		    task_util(p) > (capacity_orig_of(env->src_cpu) >> 3))
+		    task_util(p) > (capacity_orig_of(env->src_cpu) >> 5))
 			return 1;
-		return delta < (s64)sysctl_sched_migration_cost * 2;
 	}
 
 	return delta < (s64)sysctl_sched_migration_cost;

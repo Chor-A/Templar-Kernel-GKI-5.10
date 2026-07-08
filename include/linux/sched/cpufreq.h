@@ -29,7 +29,7 @@ static inline unsigned long map_util_freq(unsigned long util,
 	return (freq + (freq >> 2)) * util / cap;
 }
 /* Vorpal CPUFreq governor helpers — GKI 5.10 */
-void rfx_get_util_gki510(int cpu, unsigned long boost,
+void rfx_get_util_gki510(int cpu, unsigned long boost, bool gaming,
 			 unsigned long *out_util, unsigned long *out_bw_min);
 bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bw_min);
 #endif /* CONFIG_CPU_FREQ */

@@ -954,24 +954,38 @@ cpufreq_governor_init(schedutil_gov);
 /**
  * rfx_get_util_gki510 - GKI 5.10 compatible util getter for Vorpal.
  */
-void rfx_get_util_gki510(int cpu, unsigned long boost,
+void rfx_get_util_gki510(int cpu, unsigned long boost, bool gaming,
 			 unsigned long *out_util, unsigned long *out_bw_min)
 {
 	struct rq *rq = cpu_rq(cpu);
-	unsigned long util, bw_dl, max_cap;
+	unsigned long util, max_cap;
 
-	util   = cpu_util_cfs(rq);
-	bw_dl  = cpu_bw_dl(rq);
+	max_cap = (unsigned long)arch_scale_cpu_capacity(cpu);
+
+	if (gaming) {
+		/*
+		 * Gaming: full aggregate util (CFS + RT + IRQ + DL, with uclamp),
+		 * same as mainline sugov_get_util. A CFS-only reading would miss
+		 * RT/IRQ time - audio, binder and IRQ threads run as RT - so the
+		 * render cores would be under-fed and a heavy frame would land late.
+		 */
+		util = schedutil_cpu_util(cpu, cpu_util_cfs(rq), max_cap,
+					  FREQUENCY_UTIL, NULL);
+	} else {
+		/*
+		 * Daily: CFS + uclamp only. The RT/IRQ aggregation keeps a small
+		 * baseline that blocks an otherwise-idle CPU from settling at its
+		 * lowest OPP; for battery, daily should follow foreground demand
+		 * down to fmin. uclamp still honors the platform's per-thread hints.
+		 */
+		util = uclamp_rq_util_with(rq, cpu_util_cfs(rq), NULL);
+	}
+
+	*out_bw_min = cpu_bw_dl(rq);
 
 	if (boost > util)
 		util = boost;
 
-	*out_bw_min = bw_dl;
-
-	/* 25% DVFS headroom — equivalent to map_util_perf() in newer kernels */
-	util = util + (util >> 2);
-
-	max_cap = (unsigned long)arch_scale_cpu_capacity(cpu);
 	*out_util = min(util, max_cap);
 }
 EXPORT_SYMBOL_GPL(rfx_get_util_gki510);
