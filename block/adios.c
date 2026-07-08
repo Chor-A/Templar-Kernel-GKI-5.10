@@ -26,6 +26,11 @@
 
 #define ADIOS_VERSION "3.2.0"
 
+/* Set in lockstep with the vorpal governor's gaming_mode (kernel/sched/fair.c);
+ * read here to throttle async/write depth harder while gaming so the render-
+ * blocking read stream keeps the device. */
+extern int sched_gaming_active;
+
 /* Request Types:
  *
  * Tier 0 (Highest Priority): Emergency & System Integrity Requests
@@ -248,6 +253,7 @@ struct adios_data {
 	u32 batch_actual_max_size[ADIOS_OPTYPES];
 	u32 batch_actual_max_total;
 	u32 async_depth;
+	u32 async_depth_gaming;
 	u32 lat_model_latency_limit;
 	u8  bq_refill_below_ratio;
 	u8  is_rotational;
@@ -269,7 +275,6 @@ struct adios_data {
 	struct timer_list update_timer;
 
 	union adios_in_flight_rqs in_flight_rqs;
-	atomic64_t total_pred_lat;
 
 	struct adios_pcpu_completion __percpu *pcpu_completion;
 
@@ -312,6 +317,14 @@ static const int adios_prio_to_wmult[40] = {
 
 static inline bool compliant(struct adios_data *ad, u32 flag) {
 	return ad->compliance_flags & flag;
+}
+
+// Effective batch latency window: halved while gaming so batches stay near one
+// frame of predicted I/O and an urgent read is dispatched sooner. Tracks the
+// live sysfs value; in lockstep with the vorpal governor's gaming_mode.
+static inline u64 adios_latency_window(struct adios_data *ad) {
+	u64 w = ad->global_latency_window;
+	return READ_ONCE(sched_gaming_active) ? w >> 1 : w;
 }
 
 // Count the number of entries in aggregated small buckets
@@ -816,7 +829,9 @@ static void adios_limit_depth(unsigned int opf, struct blk_mq_alloc_data *data) 
 	if (op_is_sync(opf) && !op_is_write(opf))
 		return;
 
-	data->shallow_depth = ad->async_depth;
+	// Gaming: tighter async/write depth so reads keep the device
+	data->shallow_depth = READ_ONCE(sched_gaming_active) ?
+		ad->async_depth_gaming : ad->async_depth;
 }
 
 // The number of requests in the queue was notified from the block layer
@@ -827,8 +842,11 @@ static void adios_depth_updated(struct blk_mq_hw_ctx *hctx) {
 	unsigned int shift = tags->bitmap_tags->sb.shift;
 
 	ad->async_depth = max(1U, 3 * (1U << shift)  / 4);
+	ad->async_depth_gaming = max(1U, ad->async_depth >> 1);
 
-	sbitmap_queue_min_shallow_depth(tags->bitmap_tags, ad->async_depth);
+	/* register the smaller (gaming) depth so the sbitmap wake batch is sized
+	 * correctly for both profiles */
+	sbitmap_queue_min_shallow_depth(tags->bitmap_tags, ad->async_depth_gaming);
 }
 
 // Handle request merging after a merge operation
@@ -1097,7 +1115,7 @@ static bool fill_batch_queues(struct adios_data *ad, u64 tpl) {
 			break;
 		}
 
-		// Reads if both queues have requests, otherwise pick the non-empty.
+		/* pick the non-empty tree; if both, the bias below refines it */
 		dl_idx = dl_queued >> 1;
 
 		// Get the first request from the deadline-sorted tree
@@ -1124,7 +1142,7 @@ static bool fill_batch_queues(struct adios_data *ad, u64 tpl) {
 		// Check batch size and total predicted latency
 		if (count && (!has_base ||
 				ad->batch_count[page][optype] >= ad->batch_limit[optype] ||
-				(tpl + added_lat + rd->pred_lat) > ad->global_latency_window)) {
+				(tpl + added_lat + rd->pred_lat) > adios_latency_window(ad))) {
 			stop = true;
 			break;
 		}
@@ -1250,7 +1268,7 @@ static struct request *dispatch_from_bq(struct adios_data *ad) {
 	// current page is empty or the total ongoing latency is below the threshold
 	if (!bq_page_has_rq(bq_state, !ad->bq_page) &&
 			(!bq_curr_page_has_rq || (!tpl || tpl < div_u64(
-			ad->global_latency_window * ad->bq_refill_below_ratio, 100))) &&
+			adios_latency_window(ad) * ad->bq_refill_below_ratio, 100))) &&
 			eval_this_adios_state(state, ADIOS_STATE_DL))
 		fill_batch_queues(ad, tpl);
 
@@ -1281,7 +1299,8 @@ static struct request *dispatch_from_pq(struct adios_data *ad) {
 
 	guard(spinlock_irqsave)(&ad->pq_lock);
 	u32 pq_state = eval_adios_state(ad, ADIOS_STATE_PQ);
-	u8  pq_idx = pq_state >> 1;
+	/* prio_queue[0] is Tier-0 (highest); serve it first when both are set */
+	u8  pq_idx = (pq_state & 0x1) ? 0 : 1;
 	struct list_head *q = &ad->prio_queue[pq_idx];
 
 	if (unlikely(list_empty(q))) return NULL;
