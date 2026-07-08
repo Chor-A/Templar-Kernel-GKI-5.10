@@ -19,6 +19,8 @@
 #include <linux/compiler.h>
 #include <linux/rbtree.h>
 #include <linux/sbitmap.h>
+#include <linux/vmstat.h>
+#include <linux/writeback.h>
 
 #include "blk.h"
 #include "blk-mq.h"
@@ -41,9 +43,17 @@ extern void blk_sec_stats_account_io_done(
 
 #define MAX_ASYNC_WRITE_RQS	6
 
-static const int read_expire = 1200;		/* max time before a read is submitted. */
-static const int write_expire = 20 * HZ;		/* ditto for writes, these limits are SOFT! */
-static const int max_write_starvation = 6;	/* max times reads can starve a write */
+/*
+ * Tunables — strong read priority for low-latency reads on mobile flash
+ * (UFS/eMMC); writeback stays bounded by the starvation limit and the 5s
+ * deadline so deferred writes can't pile into a stalling flush. One balanced
+ * profile in all modes: a gaming read/write bias here repeatedly backfired
+ * (read monopolised the device -> in-game ping; async throttle -> long-session
+ * freeze). FPS is defended by the cpufreq governor floors, not by I/O bias.
+ */
+static const int read_expire = 250;		/* max time (ms) before a read is submitted. */
+static const int write_expire = 5000;		/* ditto for writes (ms), these limits are SOFT! */
+static const int max_write_starvation = 8;	/* max times reads can starve a write */
 static const int congestion_threshold = 50;	/* percentage of congestion threshold */
 static const int max_tgroup_io_ratio = 15;	/* maximum service ratio for each thread group */
 static const int max_async_write_ratio = 8;	/* maximum service ratio for async write */
@@ -95,6 +105,7 @@ struct ssg_data {
 	 * I/O context information for each request
 	 */
 	struct ssg_request_info *rq_info;
+	unsigned int rq_info_size;	/* number of allocated rq_info entries */
 
 	spinlock_t lock;
 	spinlock_t zone_lock;
@@ -148,7 +159,7 @@ static inline struct ssg_request_info *ssg_rq_info(struct ssg_data *ssg,
 	if (unlikely(rq->internal_tag < 0))
 		return NULL;
 
-	if (unlikely(rq->internal_tag >= rq->q->nr_requests))
+	if (unlikely(rq->internal_tag >= ssg->rq_info_size))
 		return NULL;
 
 	return &ssg->rq_info[rq->internal_tag];
@@ -481,10 +492,14 @@ static void ssg_depth_updated(struct blk_mq_hw_ctx *hctx)
 	ssg->congestion_threshold_rqs = depth * congestion_threshold / 100U;
 
 	kfree(ssg->rq_info);
-	ssg->rq_info = kmalloc(depth * sizeof(struct ssg_request_info),
-			GFP_KERNEL | __GFP_ZERO);
-	if (ZERO_OR_NULL_PTR(ssg->rq_info))
+	ssg->rq_info = kcalloc(depth, sizeof(struct ssg_request_info),
+			GFP_KERNEL);
+	if (ZERO_OR_NULL_PTR(ssg->rq_info)) {
 		ssg->rq_info = NULL;
+		ssg->rq_info_size = 0;
+	} else {
+		ssg->rq_info_size = depth;
+	}
 
 	ssg_set_shallow_depth(ssg, tags);
 	sbitmap_queue_min_shallow_depth(tags->bitmap_tags,
@@ -502,11 +517,12 @@ static unsigned int ssg_async_write_shallow_depth(unsigned int op,
 		struct blk_mq_alloc_data *data)
 {
 	struct ssg_data *ssg = data->q->elevator->elevator_data;
+	int max_aw = ssg->max_async_write_rqs;
 
 	if (!ssg_op_is_async_write(op))
 		return 0;
 
-	if (atomic_read(&ssg->async_write_rqs) < ssg->max_async_write_rqs)
+	if (atomic_read(&ssg->async_write_rqs) < max_aw)
 		return 0;
 
 	return ssg->async_write_shallow_depth;
@@ -516,21 +532,30 @@ static unsigned int ssg_tgroup_shallow_depth(struct blk_mq_alloc_data *data)
 {
 	struct ssg_data *ssg = data->q->elevator->elevator_data;
 	pid_t tgid = task_tgid_nr(current->group_leader);
-	int nr_requests = data->q->nr_requests;
 	int tgroup_rqs = 0;
-	int i;
+	unsigned int i;
 
 	if (unlikely(!ssg->rq_info))
 		return 0;
 
-	for (i = 0; i < nr_requests; i++)
-		if (tgid == ssg->rq_info[i].tgid)
-			tgroup_rqs++;
+	/*
+	 * Only the threshold matters, not the exact count: stop the scan the
+	 * moment this thread group reaches max_tgroup_rqs. This runs on the
+	 * allocation path whenever the queue is congested, so bounding the walk
+	 * shaves allocation latency instead of always sweeping every rq_info slot.
+	 * (max_tgroup_rqs <= 0 keeps the original "throttle unconditionally"
+	 * semantics on a degenerately shallow queue.)
+	 */
+	if (ssg->max_tgroup_rqs <= 0)
+		return ssg->tgroup_shallow_depth;
 
-	if (tgroup_rqs < ssg->max_tgroup_rqs)
-		return 0;
+	for (i = 0; i < ssg->rq_info_size; i++) {
+		if (tgid == ssg->rq_info[i].tgid &&
+		    ++tgroup_rqs >= ssg->max_tgroup_rqs)
+			return ssg->tgroup_shallow_depth;
+	}
 
-	return ssg->tgroup_shallow_depth;
+	return 0;
 }
 
 static void ssg_limit_depth(unsigned int op, struct blk_mq_alloc_data *data)
@@ -599,9 +624,9 @@ static int ssg_init_queue(struct request_queue *q, struct elevator_type *e)
     INIT_LIST_HEAD(&ssg->fifo_list[WRITE]);
     ssg->sort_list[READ] = RB_ROOT;
     ssg->sort_list[WRITE] = RB_ROOT;
-    ssg->fifo_expire[READ]  = msecs_to_jiffies(1200);
-    ssg->fifo_expire[WRITE] = msecs_to_jiffies(20000);
-    ssg->max_write_starvation = 6;
+    ssg->fifo_expire[READ]  = msecs_to_jiffies(read_expire);
+    ssg->fifo_expire[WRITE] = msecs_to_jiffies(write_expire);
+    ssg->max_write_starvation = max_write_starvation;
     ssg->front_merges = 1;
     blk_queue_max_hw_sectors(q, 128 * 8);
     q->backing_dev_info->ra_pages = 128;
@@ -613,10 +638,14 @@ static int ssg_init_queue(struct request_queue *q, struct elevator_type *e)
     ssg->congestion_threshold_rqs = q->nr_requests * congestion_threshold / 100U;
     ssg->max_async_write_rqs = MAX_ASYNC_WRITE_RQS;
     
-    ssg->rq_info = kmalloc(q->nr_requests * sizeof(struct ssg_request_info),
-            GFP_KERNEL | __GFP_ZERO);
-    if (ZERO_OR_NULL_PTR(ssg->rq_info))
+    ssg->rq_info = kcalloc(q->nr_requests, sizeof(struct ssg_request_info),
+            GFP_KERNEL);
+    if (ZERO_OR_NULL_PTR(ssg->rq_info)) {
         ssg->rq_info = NULL;
+        ssg->rq_info_size = 0;
+    } else {
+        ssg->rq_info_size = q->nr_requests;
+    }
 
     spin_lock_init(&ssg->lock);
     spin_lock_init(&ssg->zone_lock);
@@ -863,7 +892,7 @@ static ssize_t __FUNC(struct elevator_queue *e, const char *page, size_t count)	
 }
 STORE_FUNCTION(ssg_read_expire_store, &ssg->fifo_expire[READ], 0, INT_MAX, 1);
 STORE_FUNCTION(ssg_write_expire_store, &ssg->fifo_expire[WRITE], 0, INT_MAX, 1);
-STORE_FUNCTION(ssg_max_write_starvation_store, &ssg->max_write_starvation, INT_MIN, INT_MAX, 0);
+STORE_FUNCTION(ssg_max_write_starvation_store, &ssg->max_write_starvation, 0, INT_MAX, 0);
 STORE_FUNCTION(ssg_front_merges_store, &ssg->front_merges, 0, 1, 0);
 #undef STORE_FUNCTION
 
