@@ -39,9 +39,9 @@ extern void blk_sec_stats_account_io_done(
 #define blk_sec_stats_account_io_done(rq, size, tgid, name, time) do {} while(0)
 #endif
 
-#define MAX_ASYNC_WRITE_RQS	6
+#define MAX_ASYNC_WRITE_RQS	10
 
-static const int read_expire = 1200;		/* max time before a read is submitted. */
+static const int read_expire = 600;		/* max time before a read is submitted. */
 static const int write_expire = 20 * HZ;		/* ditto for writes, these limits are SOFT! */
 static const int max_write_starvation = 6;	/* max times reads can starve a write */
 static const int congestion_threshold = 50;	/* percentage of congestion threshold */
@@ -523,6 +523,10 @@ static unsigned int ssg_tgroup_shallow_depth(struct blk_mq_alloc_data *data)
 	if (unlikely(!ssg->rq_info))
 		return 0;
 
+	if (!tgid)
+		return 0;
+
+	/* O(n) scan; per-tgid counter would be faster if congestion is frequent */
 	for (i = 0; i < nr_requests; i++)
 		if (tgid == ssg->rq_info[i].tgid)
 			tgroup_rqs++;
@@ -599,9 +603,9 @@ static int ssg_init_queue(struct request_queue *q, struct elevator_type *e)
     INIT_LIST_HEAD(&ssg->fifo_list[WRITE]);
     ssg->sort_list[READ] = RB_ROOT;
     ssg->sort_list[WRITE] = RB_ROOT;
-    ssg->fifo_expire[READ]  = msecs_to_jiffies(1200);
-    ssg->fifo_expire[WRITE] = msecs_to_jiffies(20000);
-    ssg->max_write_starvation = 6;
+    ssg->fifo_expire[READ]  = msecs_to_jiffies(read_expire);
+    ssg->fifo_expire[WRITE] = write_expire;
+    ssg->max_write_starvation = max_write_starvation;
     ssg->front_merges = 1;
     blk_queue_max_hw_sectors(q, 128 * 8);
     q->backing_dev_info->ra_pages = 128;
