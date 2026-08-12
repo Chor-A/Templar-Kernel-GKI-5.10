@@ -363,8 +363,6 @@ static void f2fs_write_end_io(struct bio *bio)
 				wq_has_sleeper(&sbi->cp_wait))
 			wake_up(&sbi->cp_wait);
 
-		if (f2fs_in_warm_node_list(sbi, page))
-			f2fs_del_fsync_node_entry(sbi, page);
 		clear_page_private_gcing(page);
 		end_page_writeback(page);
 	}
@@ -906,9 +904,9 @@ void f2fs_submit_all_merged_ipu_writes(struct f2fs_sb_info *sbi)
 		if (list_empty(&io->bio_list))
 			continue;
 
-		down_write(&io->bio_list_lock);
+		f2fs_down_write(&io->bio_list_lock);
 		list_splice_init(&io->bio_list, &list);
-		up_write(&io->bio_list_lock);
+		f2fs_up_write(&io->bio_list_lock);
 
 		list_for_each_entry_safe(be, tmp, &list, list) {
 			__submit_bio(sbi, be->bio, DATA);

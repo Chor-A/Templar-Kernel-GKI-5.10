@@ -241,7 +241,6 @@ static void scsi_eh_inc_host_failed(struct rcu_head *head)
 {
 	struct scsi_cmnd *scmd = container_of(head, typeof(*scmd), rcu);
 	struct Scsi_Host *shost = scmd->device->host;
-	
 	unsigned long flags;
 
 	spin_lock_irqsave(shost->host_lock, flags);

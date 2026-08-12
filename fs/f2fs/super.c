@@ -605,7 +605,7 @@ static int f2fs_set_zstd_level(struct f2fs_sb_info *sbi, const char *str)
 	if (kstrtouint(str + 1, 10, &level))
 		return -EINVAL;
 
-	if (!level || level > ZSTD_maxCLevel()) {
+	if (!level || level > zstd_max_clevel()) {
 		f2fs_info(sbi, "invalid zstd compress level: %d", level);
 		return -EINVAL;
 	}
@@ -2339,7 +2339,7 @@ static int f2fs_remount(struct super_block *sb, int *flags, char *data)
 		} else {
 			err = f2fs_enable_checkpoint(sbi);
 			if (err)
-				goto restore_gc;
+				goto restore_flush;
 		}
 	}
 

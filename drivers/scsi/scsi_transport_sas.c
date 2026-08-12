@@ -1674,6 +1674,16 @@ static int sas_user_scan(struct Scsi_Host *shost, uint channel,
 			scsi_scan_target(&rphy->dev, 0, rphy->scsi_target_id,
 					 lun, SCSI_SCAN_MANUAL);
 		}
+		break;
+
+	default:
+		if (channel <= shost->max_channel) {
+			res = scsi_scan_host_selected(shost, channel, id, lun,
+						      SCSI_SCAN_MANUAL);
+		} else {
+			res = -EINVAL;
+		}
+		break;
 	}
 	mutex_unlock(&sas_host->lock);
 

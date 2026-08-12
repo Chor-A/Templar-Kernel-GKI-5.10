@@ -746,7 +746,12 @@ config LLVM_POLLY
    Polly is able to optimize various loops throughout the kernel for
    maximum cache locality. This requires an LLVM toolchain explicitly
    compiled with Polly support.
-   
+
+config CFI_FORCE_SKIP_CHECK
+	bool "Skip execution of __cfi_check function"
+	def_bool y if CLANG_VERSION >= 190100
+	depends on CFI_CLANG
+
 config HAVE_ARCH_WITHIN_STACK_FRAMES
 	bool
 	help
