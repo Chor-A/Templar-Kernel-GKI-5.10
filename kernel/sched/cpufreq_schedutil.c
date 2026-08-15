@@ -953,25 +953,49 @@ cpufreq_governor_init(schedutil_gov);
 
 /**
  * rfx_get_util_gki510 - GKI 5.10 compatible util getter for Vorpal.
+ *
+ * Must go through schedutil_cpu_util(), not raw cpu_util_cfs(). The raw CFS
+ * signal alone is blind to four things that dominate this platform:
+ *
+ *   uclamp  - CONFIG_UCLAMP_TASK_GROUP is on and Android's task_profiles set
+ *             uclamp.min on the top-app cgroup. That is the primary boost
+ *             channel on the device; reading cpu_util_cfs() directly ignores
+ *             it outright, so every foreground/top-app hint the framework
+ *             raised - scroll, launch, frame deadline - reached the governor
+ *             as nothing at all.
+ *   RT util - SurfaceFlinger's render path, audio, and the display/vsync
+ *             kthreads are SCHED_FIFO. Their time is 'lost time' to CFS, so
+ *             a cluster carrying them looked idle and was clocked for an idle
+ *             cluster while the frame it was drawing missed.
+ *   DL bw   - cpu_bw_dl() is reserved bandwidth that must be granted.
+ *   IRQ     - scale_irq_capacity() corrects util for time stolen by
+ *             interrupts, which on a phone under touch is not negligible.
+ *
+ * schedutil_cpu_util(FREQUENCY_UTIL) is the same aggregation every other
+ * governor in the tree uses, including its saturation shortcut. The 25%
+ * margin stays here because Vorpal maps util->freq itself (fmax * util /
+ * cap) rather than through map_util_freq(), which is where that margin
+ * normally lives.
  */
 void rfx_get_util_gki510(int cpu, unsigned long boost,
 			 unsigned long *out_util, unsigned long *out_bw_min)
 {
 	struct rq *rq = cpu_rq(cpu);
-	unsigned long util, bw_dl, max_cap;
+	unsigned long util, max_cap;
 
-	util   = cpu_util_cfs(rq);
-	bw_dl  = cpu_bw_dl(rq);
+	max_cap = (unsigned long)arch_scale_cpu_capacity(cpu);
+
+	*out_bw_min = cpu_bw_dl(rq);
+
+	util = schedutil_cpu_util(cpu, cpu_util_cfs(rq), max_cap,
+				  FREQUENCY_UTIL, NULL);
 
 	if (boost > util)
 		util = boost;
 
-	*out_bw_min = bw_dl;
-
 	/* 25% DVFS headroom — equivalent to map_util_perf() in newer kernels */
 	util = util + (util >> 2);
 
-	max_cap = (unsigned long)arch_scale_cpu_capacity(cpu);
 	*out_util = min(util, max_cap);
 }
 EXPORT_SYMBOL_GPL(rfx_get_util_gki510);
