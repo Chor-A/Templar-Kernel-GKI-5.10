@@ -114,13 +114,15 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
 #define RFX_LITTLE_UP_US		200
 #define RFX_LITTLE_DOWN_US		3000
 
-#define RFX_BIG_RATE_US			1000
+/* Daily Big/Prime evaluations can follow PELT at 1.5ms; interaction uses
+ * the separate 700us gate and gaming remains on the 250us gate. */
+#define RFX_BIG_RATE_US			1500
 #define RFX_BIG_UP_US			0
-#define RFX_BIG_DOWN_US			8000
+#define RFX_BIG_DOWN_US			6000
 
-#define RFX_PRIME_RATE_US		1000
+#define RFX_PRIME_RATE_US		1500
 #define RFX_PRIME_UP_US			0
-#define RFX_PRIME_DOWN_US		8000
+#define RFX_PRIME_DOWN_US		6000
 
 /*
  * Evaluation rate while gaming, or while the touch window is open. Frame pacing
