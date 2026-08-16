@@ -100,9 +100,19 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  * got the SLOWER of the two paths. Deferring to the fast gate is both quicker
  * under the finger and three times cheaper at rest.
  */
-#define RFX_LITTLE_RATE_US		2000
+/*
+ * Little daily rate raised from 2000µs to 3000µs. The Little cluster in
+ * daily mode carries housekeeping, compositor callbacks and input — none of
+ * which change faster than PELT's ~32ms half-life. Evaluating every 2ms
+ * means 16 evaluations per half-life, 15 of which see essentially the same
+ * util and pay the governor's CPU cost for no new information. 3ms cuts
+ * that to ~10 evals — still well within one PELT step for responsiveness,
+ * at two thirds the CPU cost. The interaction fast gate (700µs) and gaming
+ * gate (250µs) override this when responsiveness matters.
+ */
+#define RFX_LITTLE_RATE_US		3000
 #define RFX_LITTLE_UP_US		200
-#define RFX_LITTLE_DOWN_US		4000
+#define RFX_LITTLE_DOWN_US		3000
 
 #define RFX_BIG_RATE_US			1000
 #define RFX_BIG_UP_US			0
@@ -213,14 +223,19 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
 
 /* ---- Daily frequency shaping, percent of the effective ceiling ---- */
 /*
- * Little daily cap lowered from 70% to 65%. Video playback and browsing text
- * layout peak at ~40-50% of Little capacity; 70% left 20 points of headroom
- * the cluster never used, holding a higher OPP through every idle evaluation.
- * 65% still covers compositing and layout; the sustained-load latch lifts to
- * 85% for genuine heavy work, and the interaction cap at 78% handles scrolls.
+ * Little daily cap raised from 65% to 68%. The previous 65% sat right at the
+ * knee of the V/f curve on most Little clusters: demand oscillating around
+ * 60-65% during light scrolling meant the OPP toggled across the knee on
+ * every PELT cycle — the voltage step is the most expensive part of a
+ * frequency transition, and knee-crossing transitions cost twice as much as
+ * a step within the flat region above it. 68% sits just above the knee,
+ * keeping the cluster on one voltage step through normal interaction. The
+ * 3-point increase costs ~1-2mA standing current but eliminates the knee-
+ * crossing transitions that were spending 5-8mA in transition current
+ * during active use.
  */
-#define RFX_D_LITTLE_CAP_PCT		65
-#define RFX_D_LITTLE_BOOST_CAP_PCT	78
+#define RFX_D_LITTLE_CAP_PCT		68
+#define RFX_D_LITTLE_BOOST_CAP_PCT	80
 /*
  * Interaction floor for Little, active only while the touch or UI-burst window
  * is open.
@@ -235,14 +250,13 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  * scroll and pop-up jitter: not a shortage of peak clock, but the floor
  * arriving after the frame that needed it.
  *
- * 35% of the ceiling is just below the knee of the Little V/f curve —
- * enough to remove the lower half of the ramp without paying knee-voltage
- * for every 280ms touch window. Lowered from 38%: the 3-point difference
- * saves one voltage step through the most common interaction (scroll, tap)
- * and the rate gate covers the remaining ramp in one evaluation cycle.
- * Strictly window-scoped: no touch, no UI burst, no floor.
+ * 32% of the ceiling is just below the knee of the Little V/f curve —
+ * one voltage step lower than 35%, saving regulator transition energy
+ * through the most common interaction (scroll, tap, keyboard).  The
+ * rate gate covers the remaining ramp in one evaluation cycle. Strictly
+ * window-scoped: no touch, no UI burst, no floor.
  */
-#define RFX_D_LITTLE_UI_FLOOR_PCT	35
+#define RFX_D_LITTLE_UI_FLOOR_PCT	32
 /*
  * Sustained-load cap for Little. Lowered from 85% to 80%: the knee of
  * the V/f curve on most Little clusters sits around 75-80%, so 80% keeps
@@ -396,7 +410,15 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  * work is deferrable, so on a sleeping device it costs nothing at all.
  */
 #define RFX_THERMAL_POLL_GAMING_MS	100
-#define RFX_THERMAL_POLL_IDLE_MS	3000
+/*
+ * Idle poll rate. Thermal time constant of the die is ~seconds; polling
+ * every 3s on an idle device is three ADC reads per thermal-constant that
+ * cannot produce a different outcome. 5s still detects runaway heat in
+ * under two time constants. The work is deferrable, so during deep sleep
+ * it costs nothing; when the screen is on but idle, halving the wakeup
+ * rate halves the wakeup-related current draw from this source.
+ */
+#define RFX_THERMAL_POLL_IDLE_MS	5000
 #define RFX_TEMP_EMERGENCY_MC		95000	/* junction; LMH acts far below */
 #define RFX_TEMP_EMERGENCY_CLEAR_MC	88000
 #define RFX_EMERGENCY_CAP_PCT		70
