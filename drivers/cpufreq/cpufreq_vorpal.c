@@ -446,33 +446,6 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
 #define RFX_GAMING_WARMUP_NS		(700 * NSEC_PER_MSEC)
 
 /*
- * Sustained load lock: util above ENTER for HOLD_NS marks a benchmark or
- * throttle test - steady saturation rather than frame-paced bursts. Its only
- * job is to silence the frame-risk detector: there are no frames to protect,
- * so arming boost windows on steady load just burns thermal budget. It does
- * not raise any floor - saturating load already reaches fmax via the headroom
- * path on its own.
- *
- * Set to 92% to avoid false positives during heavy gaming scenes while still
- * detecting benchmarks. Real gaming rarely sustains above 90% continuously.
- */
-#define RFX_SUSTAINED_LOAD_ENTER_PCT	92
-/*
- * Exit threshold raised from 78% to 85%: the previous 14-point gap (92-78)
- * kept the lock active at 80-84% demand — heavy gaming, not a benchmark —
- * muting the frame-risk detector through scenes that genuinely drop frames.
- * Heavy gaming regularly sustains 80-85%; after a benchmark→game transition
- * the lock stayed latched and frame-miss recovery was dead until demand
- * happened to dip below 78%, which in a continuous session might not happen
- * for minutes. 7 points (92-85) is still wide enough that a benchmark
- * oscillating ±3% around 90% cannot flap the latch, and narrow enough that
- * any real game scene (which rarely sustains above 85% continuously)
- * releases the lock and re-enables frame-miss recovery promptly.
- */
-#define RFX_SUSTAINED_LOAD_EXIT_PCT	85
-#define RFX_SUSTAINED_LOAD_HOLD_NS	(300 * NSEC_PER_MSEC)
-
-/*
  * Gaming floor demand gate. Floors exist to stop a loaded cluster sagging
  * mid-frame; they are not meant to hold an EMPTY cluster at 66% of fmax. An
  * idle cluster burning band-floor voltage is pure heat, and heat is what makes
@@ -636,9 +609,6 @@ struct rfx_policy {
 	bool risk_high;			/* frame-risk edge state */
 	bool little_cap_lifted;		/* daily: sustained-load cap lift latch */
 
-	/* Sustained load lock (benchmark / throttle test) */
-	u64 sustained_since_ns;		/* first tick above ENTER, 0 = not counting */
-	bool sustained_locked;
 };
 
 struct rfx_cpu {
@@ -816,25 +786,6 @@ static unsigned int rfx_update_frame_boost_ramp(struct rfx_policy *p, bool boost
 	return p->frame_boost_ramp_pct;
 }
 
-/*
- * Sustained load lock. Steady saturation for HOLD_NS means a benchmark or
- * throttle test rather than frame-paced game load. Latches p->sustained_locked,
- * which silences the frame-risk detector (steady saturation is not a frame
- * miss). ENTER/EXIT hysteresis keeps it from flapping mid-run.
- */
-static void rfx_update_sustained_lock(struct rfx_policy *p, unsigned int upct, u64 time)
-{
-	if (upct >= RFX_SUSTAINED_LOAD_ENTER_PCT) {
-		if (!p->sustained_since_ns)
-			p->sustained_since_ns = time;
-		else if (time - p->sustained_since_ns >= RFX_SUSTAINED_LOAD_HOLD_NS)
-			p->sustained_locked = true;
-	} else if (upct <= RFX_SUSTAINED_LOAD_EXIT_PCT) {
-		p->sustained_since_ns = 0;
-		p->sustained_locked = false;
-	}
-}
-
 /* ===================================================================== */
 /* Util smoothing                                                        */
 /* ===================================================================== */
@@ -845,14 +796,13 @@ static void rfx_update_sustained_lock(struct rfx_policy *p, unsigned int upct, u
  * but it must still reach the bottom, so the step scales with elapsed time.
  *
  * At the reference period (250us) this removes 1/8 of the error, matching the
- * old shift-3 gaming path. At 1500us (daily Little) it removes 6/8 in one
- * call — the same wall-clock rate, not 6x slower. Capped at the full diff so
- * a long idle gap converges in one step.
+ * old shift-3 gaming path. Longer gaps apply the same decay once per elapsed
+ * period, capped at eight steps to bound update-hook work.
  */
 static unsigned long rfx_ema(unsigned long old, unsigned long val,
 			     u64 delta_ns, bool gaming)
 {
-	unsigned long diff, step;
+	unsigned long diff;
 	unsigned int steps;
 
 	if (!old)
@@ -873,10 +823,11 @@ static unsigned long rfx_ema(unsigned long old, unsigned long val,
 	if (!gaming)
 		return val;
 
-	diff = old - val;
 	/*
 	 * steps = how many reference periods elapsed (integer division floors).
-	 * Capped at 8 so that any gap >= 2ms converges fully in one call.
+	 * Apply one 1/8 decay for each elapsed period. Repeated exponential decay
+	 * preserves about 34% of the error after 2ms instead of dropping the
+	 * filtered demand to the instantaneous sample in one evaluation.
 	 *
 	 * Do NOT force steps=1 when delta_ns < one period: the hook re-enters
 	 * faster than 250us on need_freq_update / limits_changed bypasses, and
@@ -888,10 +839,15 @@ static unsigned long rfx_ema(unsigned long old, unsigned long val,
 	steps = (unsigned int)min_t(u64, delta_ns / RFX_EMA_DECAY_PERIOD_NS, 8);
 	if (!steps)
 		return old;	/* sub-period: hold, don't decay */
-	step = diff * steps / 8;
-	if (!step)
-		step = 1;	/* avoid stall at small diff */
-	return old - step;
+
+	while (steps--) {
+		diff = old - val;
+		if (!diff)
+			break;
+		old -= max_t(unsigned long, diff / 8, 1);
+	}
+
+	return old;
 }
 
 /*
@@ -980,12 +936,6 @@ static void rfx_frame_risk_check(struct rfx_policy *p, unsigned int demand_pct,
 {
 	if (likely(p->is_little))
 		return;
-
-	/* Steady saturation is a benchmark, not a frame miss - no boost. */
-	if (p->sustained_locked) {
-		p->risk_high = false;
-		return;
-	}
 
 	if (demand_pct < RFX_RISK_SATURATION_PCT) {
 		/*
@@ -1124,7 +1074,6 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 			boost_fl = rfx_pct(fceil, RFX_G_LITTLE_FLOOR_BOOST_PCT);
 		}
 
-		rfx_update_sustained_lock(p, demand_pct, time);
 		/*
 		 * The emergency net clamps the final result, so the floor a
 		 * boost could actually install is the clamped one - hand the
@@ -1895,8 +1844,6 @@ static void rfx_reset_all_policies(void)
 		p->frame_boost_ramp_last_ns = 0;
 		p->gaming_warmup_end_ns = 0;
 		p->risk_high = false;
-		p->sustained_since_ns = 0;
-		p->sustained_locked = false;
 		p->need_freq_update = true;
 		raw_spin_unlock_irqrestore(&p->update_lock, pflags);
 	}
@@ -1940,8 +1887,6 @@ static ssize_t gaming_mode_store(struct gov_attr_set *attr_set,
 			p->coldstart_boost_end_ns = 0;
 			p->prev_upct = 0;
 			p->prev_upct_ns = 0;
-			p->sustained_since_ns = 0;
-			p->sustained_locked = false;
 			/* Stale risk latch from a previous session. */
 			p->risk_high = false;
 			raw_spin_unlock_irqrestore(&p->update_lock, pflags);
@@ -2290,8 +2235,6 @@ static int rfx_start(struct cpufreq_policy *policy)
 	p->gaming_warmup_end_ns = 0;
 	p->risk_high = false;
 	p->little_cap_lifted = false;
-	p->sustained_since_ns = 0;
-	p->sustained_locked = false;
 
 	spin_lock_irqsave(&rfx_policy_list_lock, flags);
 	list_add(&p->gov_node, &rfx_policy_list);
