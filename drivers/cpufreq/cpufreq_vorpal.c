@@ -187,10 +187,8 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  * floors are for frame pacing only.
  */
 #define RFX_G_PRIME_FLOOR_PCT		70
-#define RFX_G_PRIME_CAP_PCT		100
 #define RFX_G_PRIME_FRAME_PCT		88
 #define RFX_G_BIG_FLOOR_PCT		66
-#define RFX_G_BIG_CAP_PCT		100
 #define RFX_G_BIG_FRAME_PCT		86
 /*
  * Little floor at 55%: the compositor, input pipeline and audio thread live
@@ -201,7 +199,6 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  * the typical compositor demand, so the floor holds through the gap.
  * Boost floor at 74% for frame-miss recovery on the input pipeline.
  */
-#define RFX_G_LITTLE_CAP_PCT		100
 #define RFX_G_LITTLE_FLOOR_PCT		55
 #define RFX_G_LITTLE_FLOOR_BOOST_PCT	74
 
@@ -345,9 +342,8 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  * changed the decay speed discontinuously.
  *
  * RFX_EMA_DECAY_PERIOD_NS is the reference interval at which one eighth of
- * the error is removed — matching the previous gaming behaviour (250us eval,
- * shift 3). At 1500us eval the call now removes 6/8 of the error per call
- * (same wall-clock rate, fewer calls), instead of the old 1/8 (6x slower).
+ * the remaining error is removed. Longer gaps repeat that exponential step
+ * once per elapsed period, with a bounded number of iterations.
  */
 #define RFX_EMA_DECAY_PERIOD_NS		250000	/* 250us: one gaming eval */
 
@@ -949,8 +945,16 @@ static void rfx_frame_risk_check(struct rfx_policy *p, unsigned int demand_pct,
 		return;
 	}
 
-	if (p->risk_high)
-		return;
+	/*
+	 * Sustained saturation may outlive one boost window. Let the latch
+	 * re-arm after expiry when the cluster has clock left to gain; otherwise
+	 * one crossing permanently disables recovery until demand falls.
+	 */
+	if (p->risk_high) {
+		if (rfx_frame_boost_active(time))
+			return;
+		p->risk_high = false;
+	}
 
 	/*
 	 * Nothing to gain: this cluster is already committed at or above the
@@ -1034,9 +1038,9 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 
 		/*
 		 * Demand before rfx_apply_headroom's inflation - what the
-		 * sustained-load lock, the risk detector and the floor gate
-		 * judge against. `util` has been inflated above, so it is not a
-		 * load measurement; feeding it to these three made every
+		 * risk detector and floor gate judge against. `util` has been
+		 * inflated above, so it is not a load measurement; feeding it
+		 * to these paths made every
 		 * threshold fire ~20 points early.
 		 *
 		 * CAVEAT, and do NOT re-tune the thresholds without reading
@@ -1124,8 +1128,6 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 
 		if (freq < fl)
 			freq = fl;
-		/* RFX_G_*_CAP_PCT are all 100 — cap == fceil, clamp is a no-op.
-		 * Re-add if a future rev lowers one. */
 	} else {
 		bool ui_active, coldstart_active;
 		unsigned int demand_pct;
