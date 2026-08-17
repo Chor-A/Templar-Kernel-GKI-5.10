@@ -183,7 +183,7 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  * previous floors costs ~2% more idle-cluster power but eliminates the
  * 0.4-1% jank from floor-to-frame hunting.
  *
- * Sustained-load headroom (15%) handles benchmark sustain separately;
+ * Sustained-load headroom (12%) handles benchmark sustain separately;
  * floors are for frame pacing only.
  */
 #define RFX_G_PRIME_FLOOR_PCT		70
@@ -384,7 +384,7 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
 /*
  * Util percent at which we stop interpolating and request fmax outright.
  * Gaming trips at 82% - earlier detection provides better frame protection
- * and benchmark sustain. With 15% headroom, real 82% demand reaches fmax
+ * and benchmark sustain. With 12% headroom, real 82% demand reaches fmax
  * reliably. Daily keeps the conservative 95% - the last OPP is a battery cost.
  */
 #define RFX_SAT_TO_MAX_GAMING_PCT	82
@@ -404,12 +404,7 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  * absent or asleep. One trip, one release, 7C apart: it cannot oscillate,
  * because it cannot re-arm without the die genuinely cooling first.
  *
- * The idle poll rate matters for a different reason: this is a delayed work
- * that reads a thermal zone, and on most platforms that read costs an ADC or
- * SMEM round trip. Waking twice a second, forever, to check for a 95C junction
- * emergency that cannot occur on an idle die is pure standby drain. 2s is still
- * an order of magnitude faster than the die's thermal time constant, and the
- * work is deferrable, so on a sleeping device it costs nothing at all.
+ * Poll-rate rationale lives on the two RFX_THERMAL_POLL_* defines below.
  */
 #define RFX_THERMAL_POLL_GAMING_MS	100
 /*
@@ -463,14 +458,18 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  */
 #define RFX_SUSTAINED_LOAD_ENTER_PCT	92
 /*
- * Exit threshold raised from 60% to 78%: a 32-point gap kept the lock active
- * at 65% demand (heavy gaming, not a benchmark), muting the frame-risk
- * detector through scenes that genuinely drop frames. 14 points (92-78) is
- * wide enough that a benchmark oscillating near the boundary cannot flap, and
- * narrow enough that heavy gaming (70-85%) releases the lock and re-enables
- * frame-miss recovery.
+ * Exit threshold raised from 78% to 85%: the previous 14-point gap (92-78)
+ * kept the lock active at 80-84% demand — heavy gaming, not a benchmark —
+ * muting the frame-risk detector through scenes that genuinely drop frames.
+ * Heavy gaming regularly sustains 80-85%; after a benchmark→game transition
+ * the lock stayed latched and frame-miss recovery was dead until demand
+ * happened to dip below 78%, which in a continuous session might not happen
+ * for minutes. 7 points (92-85) is still wide enough that a benchmark
+ * oscillating ±3% around 90% cannot flap the latch, and narrow enough that
+ * any real game scene (which rarely sustains above 85% continuously)
+ * releases the lock and re-enables frame-miss recovery promptly.
  */
-#define RFX_SUSTAINED_LOAD_EXIT_PCT	78
+#define RFX_SUSTAINED_LOAD_EXIT_PCT	85
 #define RFX_SUSTAINED_LOAD_HOLD_NS	(300 * NSEC_PER_MSEC)
 
 /*
@@ -480,13 +479,17 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  * the sustain curve decay - so below this util the floor releases entirely and
  * normal DVFS applies. A frame boost or heavy scene overrides the gate.
  *
- * Raised from 25% to 30%: a cluster at 26-29% demand is not carrying frame
- * work (the follow gate at 35% already excludes it from frame boost), yet the
- * old gate held it at the band floor for nothing — pure thermal waste.  5
- * points buys meaningful thermal budget during sustained gaming without
- * affecting any cluster that is actually in the frame path.
+ * Lowered from 30% to 25%: the compositor on Little lives at 30-40% demand
+ * during gameplay. At 30% the floor toggled between idle-floor (38%) and
+ * base-floor (55%) on every evaluation cycle — a 17-point oscillation on the
+ * cluster that carries the compositor, input pipeline and audio. That
+ * oscillation is the rendering micro-stutter tester reports see. 25% keeps
+ * every cluster that is doing real work (compositor included) on the stable
+ * base floor, while still releasing truly idle clusters. The thermal cost is
+ * negligible: a cluster at 26-29% demand draws almost nothing at the base
+ * floor vs the idle floor (one voltage step, same leakage domain).
  */
-#define RFX_G_FLOOR_GATE_PCT		30
+#define RFX_G_FLOOR_GATE_PCT		25
 
 /*
  * Demand a cluster must show before it follows the GLOBAL frame boost up to
@@ -794,9 +797,19 @@ static unsigned int rfx_update_frame_boost_ramp(struct rfx_policy *p, bool boost
 	 * sub-step remainder by NOT advancing the timestamp until we actually
 	 * have a step to consume. This lets delta_ns grow until it crosses the
 	 * 1.2ms boundary.
+	 *
+	 * Advance the timestamp by exactly the time the step consumed, not to
+	 * `time`. The old `= time` threw away the sub-step remainder on every
+	 * decay tick, stretching total ramp time unpredictably and — worse —
+	 * leaving the ramp at a stale level when two boost windows overlap:
+	 * the floor oscillated between the decaying ramp and the new boost for
+	 * 2-3 eval cycles, which is a compositor micro-stutter.
 	 */
 	if (step > 0) {
-		p->frame_boost_ramp_last_ns = time;
+		u64 consumed_ns = (u64)step *
+			((u64)RFX_FRAME_BOOST_RAMP_DOWN_MS * NSEC_PER_MSEC) /
+			100;
+		p->frame_boost_ramp_last_ns += consumed_ns;
 		p->frame_boost_ramp_pct -= min(p->frame_boost_ramp_pct, step);
 	}
 
@@ -1240,11 +1253,11 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 				rfx_pct(fceil, RFX_D_LITTLE_CAP_PCT);
 
 			/*
-			 * Sustained heavy load relaxes the cap: the 60%
+			 * Sustained heavy load relaxes the cap: the 68%
 			 * battery cap otherwise strangles every long
 			 * multithread workload (compile, media scan,
 			 * untouched-screen game) once the touch and burst
-			 * windows expire. It relaxes to 85%, not to fmax -
+			 * windows expire. It relaxes to 80%, not to fmax -
 			 * see RFX_D_LITTLE_SUSTAINED_CAP_PCT. Light use never
 			 * reaches this demand, so idle battery is unaffected.
 			 */
