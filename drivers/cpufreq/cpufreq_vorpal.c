@@ -923,8 +923,8 @@ static inline bool rfx_frame_boost_active(u64 time)
 
 /*
  * Frame-risk detector. Arms one boost window when raw cluster demand crosses
- * RFX_RISK_SATURATION_PCT. Demand must fall below RISK_CLEAR_PCT (or the
- * boost window must expire) before another can arm. Little excluded.
+ * RFX_RISK_SATURATION_PCT. Demand must fall below RISK_CLEAR_PCT before
+ * another can arm. Little excluded.
  * Measures raw demand (before headroom inflation).
  */
 static void rfx_frame_risk_check(struct rfx_policy *p, unsigned int demand_pct,
@@ -934,27 +934,13 @@ static void rfx_frame_risk_check(struct rfx_policy *p, unsigned int demand_pct,
 		return;
 
 	if (demand_pct < RFX_RISK_SATURATION_PCT) {
-		/*
-		 * Clear risk_high on demand < clear OR boost window expired.
-		 * Without expiry check, demand in (CLEAR, SATURATION) latches
-		 * risk_high forever, killing future re-arms.
-		 */
-		if (demand_pct <= RFX_RISK_CLEAR_PCT ||
-		    !rfx_frame_boost_active(time))
+		if (demand_pct <= RFX_RISK_CLEAR_PCT)
 			p->risk_high = false;
 		return;
 	}
 
-	/*
-	 * Sustained saturation may outlive one boost window. Let the latch
-	 * re-arm after expiry when the cluster has clock left to gain; otherwise
-	 * one crossing permanently disables recovery until demand falls.
-	 */
-	if (p->risk_high) {
-		if (rfx_frame_boost_active(time))
-			return;
-		p->risk_high = false;
-	}
+	if (p->risk_high)
+		return;
 
 	/*
 	 * Nothing to gain: this cluster is already committed at or above the
