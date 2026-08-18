@@ -1832,6 +1832,9 @@ static void rfx_reset_all_policies(void)
 		p->frame_boost_ramp_last_ns = 0;
 		p->gaming_warmup_end_ns = 0;
 		p->risk_high = false;
+		/* Do not carry saturated gaming demand into the daily profile. */
+		p->filt_util = 0;
+		p->last_ema_ns = 0;
 		p->need_freq_update = true;
 		raw_spin_unlock_irqrestore(&p->update_lock, pflags);
 	}
