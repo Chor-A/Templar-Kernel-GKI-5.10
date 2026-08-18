@@ -3745,13 +3745,8 @@ struct futex_vector {
 	struct futex_q q;
 };
 
-/*
- * Serve the common small futex_waitv() array from the caller stack instead of
- * the slab. struct futex_vector is ~136 bytes, so 16 entries cost ~2 KiB of an
- * (VMAP_STACK) kernel stack, which is safe, while covering the object counts
- * Wine/FEX WaitForMultipleObjects uses in practice.
- */
-#define FUTEXV_STACK_MAX	16
+/* Four entries cover the common wait set without growing the syscall frame. */
+#define FUTEXV_STACK_MAX	4
 
 /**
  * unqueue_multiple - Remove various futexes from their hash bucket
@@ -4058,17 +4053,11 @@ SYSCALL_DEFINE5(futex_waitv, struct futex_waitv __user *, waiters,
 		futex_setup_timer(&time, &to, flag_clkid, 0);
 	}
 
-	/*
-	 * Wine/FEX WaitForMultipleObjects almost always waits on only a
-	 * handful of objects, and a busy game issues these constantly. Serve
-	 * the common small case from the stack so the hot path takes no slab
-	 * alloc/free at all; only large arrays fall back to the heap, which is
-	 * kcalloc() so the queue entries stay zeroed on the error path.
-	 */
 	if (nr_futexes <= FUTEXV_STACK_MAX) {
 		futexv = stack_futexv;
 	} else {
-		futexv = kcalloc(nr_futexes, sizeof(*futexv), GFP_KERNEL);
+		/* futex_parse_waitv() initializes every entry, so zeroing is redundant. */
+		futexv = kmalloc_array(nr_futexes, sizeof(*futexv), GFP_KERNEL);
 		if (!futexv) {
 			ret = -ENOMEM;
 			goto destroy_timer;
@@ -4079,15 +4068,21 @@ SYSCALL_DEFINE5(futex_waitv, struct futex_waitv __user *, waiters,
 	if (!ret)
 		ret = futex_wait_multiple(futexv, nr_futexes, timeout ? &to : NULL);
 
+	if (timeout) {
+		hrtimer_cancel(&to.timer);
+		destroy_hrtimer_on_stack(&to.timer);
+	}
+
 	if (futexv != stack_futexv)
 		kfree(futexv);
+
+	return ret;
 
 destroy_timer:
 	if (timeout) {
 		hrtimer_cancel(&to.timer);
 		destroy_hrtimer_on_stack(&to.timer);
 	}
-
 	return ret;
 }
 
