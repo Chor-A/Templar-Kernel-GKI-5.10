@@ -561,6 +561,11 @@ pipe_write(struct kiocb *iocb, struct iov_iter *from)
 			head = pipe->head;
 			if (pipe_full(head, pipe->tail, pipe->max_usage)) {
 				spin_unlock_irq(&pipe->rd_wait.lock);
+				/* The slot raced full; retain the page for the next write. */
+				if (!pipe->tmp_page)
+					pipe->tmp_page = page;
+				else
+					put_page(page);
 				continue;
 			}
 
