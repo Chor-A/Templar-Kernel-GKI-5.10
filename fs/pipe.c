@@ -107,48 +107,6 @@ static inline void __pipe_unlock(struct pipe_inode_info *pipe)
 	mutex_unlock(&pipe->mutex);
 }
 
-#define PIPE_PREALLOC_MAX 4
-
-struct pipe_prealloc {
-	struct page *pages[PIPE_PREALLOC_MAX];
-	unsigned int count;
-};
-
-static void pipe_prealloc_pages(struct pipe_inode_info *pipe,
-				struct pipe_prealloc *prealloc, size_t len)
-{
-	unsigned int i, nr;
-
-	prealloc->count = 0;
-	if (len <= PAGE_SIZE || !mutex_is_locked(&pipe->mutex))
-		return;
-
-	nr = min_t(unsigned int, DIV_ROUND_UP(len, PAGE_SIZE),
-		   PIPE_PREALLOC_MAX);
-	for (i = 0; i < nr; i++) {
-		struct page *page;
-
-		page = alloc_page(GFP_HIGHUSER | __GFP_ACCOUNT);
-		if (!page)
-			break;
-		prealloc->pages[prealloc->count++] = page;
-	}
-}
-
-static struct page *pipe_prealloc_pop(struct pipe_prealloc *prealloc)
-{
-	if (!prealloc->count)
-		return NULL;
-
-	return prealloc->pages[--prealloc->count];
-}
-
-static void pipe_free_prealloc(struct pipe_prealloc *prealloc)
-{
-	while (prealloc->count)
-		put_page(prealloc->pages[--prealloc->count]);
-}
-
 void pipe_double_lock(struct pipe_inode_info *pipe1,
 		      struct pipe_inode_info *pipe2)
 {
@@ -460,7 +418,6 @@ pipe_write(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *filp = iocb->ki_filp;
 	struct pipe_inode_info *pipe = filp->private_data;
-	struct pipe_prealloc prealloc;
 	unsigned int head;
 	ssize_t ret = 0;
 	size_t total_len = iov_iter_count(from);
@@ -471,8 +428,6 @@ pipe_write(struct kiocb *iocb, struct iov_iter *from)
 	/* Null write succeeds. */
 	if (unlikely(total_len == 0))
 		return 0;
-
-	pipe_prealloc_pages(pipe, &prealloc, total_len);
 
 	__pipe_lock(pipe);
 
@@ -536,19 +491,16 @@ pipe_write(struct kiocb *iocb, struct iov_iter *from)
 		if (!pipe_full(head, pipe->tail, pipe->max_usage)) {
 			unsigned int mask = pipe->ring_size - 1;
 			struct pipe_buffer *buf = &pipe->bufs[head & mask];
-			struct page *page = pipe_prealloc_pop(&prealloc);
+			struct page *page = pipe->tmp_page;
 			int copied;
 
-			if (!page) {
-				page = pipe->tmp_page;
-				pipe->tmp_page = NULL;
-			}
 			if (!page) {
 				page = alloc_page(GFP_HIGHUSER | __GFP_ACCOUNT);
 				if (unlikely(!page)) {
 					ret = ret ? : -ENOMEM;
 					break;
 				}
+				pipe->tmp_page = page;
 			}
 
 			/* Allocate a slot in the ring in advance and attach an
@@ -561,11 +513,6 @@ pipe_write(struct kiocb *iocb, struct iov_iter *from)
 			head = pipe->head;
 			if (pipe_full(head, pipe->tail, pipe->max_usage)) {
 				spin_unlock_irq(&pipe->rd_wait.lock);
-				/* The slot raced full; retain the page for the next write. */
-				if (!pipe->tmp_page)
-					pipe->tmp_page = page;
-				else
-					put_page(page);
 				continue;
 			}
 
@@ -582,6 +529,8 @@ pipe_write(struct kiocb *iocb, struct iov_iter *from)
 				buf->flags = PIPE_BUF_FLAG_PACKET;
 			else
 				buf->flags = PIPE_BUF_FLAG_CAN_MERGE;
+			pipe->tmp_page = NULL;
+
 			copied = copy_page_from_iter(page, 0, PAGE_SIZE, from);
 			if (unlikely(copied < PAGE_SIZE && iov_iter_count(from))) {
 				if (!ret)
@@ -628,12 +577,9 @@ pipe_write(struct kiocb *iocb, struct iov_iter *from)
 		wake_next_writer = true;
 	}
 out:
-	if (!pipe->tmp_page)
-		pipe->tmp_page = pipe_prealloc_pop(&prealloc);
 	if (pipe_full(pipe->head, pipe->tail, pipe->max_usage))
 		wake_next_writer = false;
 	__pipe_unlock(pipe);
-	pipe_free_prealloc(&prealloc);
 
 	/*
 	 * If we do do a wakeup event, we do a 'sync' wakeup, because we
