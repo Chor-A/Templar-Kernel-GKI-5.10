@@ -1260,7 +1260,8 @@ found:
 
 // Timer callback for model updates. Armed on-demand from the completion path
 // (timer_reduce) and deliberately does NOT re-arm itself: when I/O stops the
-// timer fires once, updates the models, then stays idle so the CPU can sleep.
+// timer fires once, updates the models, then stays idle. It is deferrable, so
+// the final completion in a burst cannot wake an otherwise idle CPU.
 static void update_timer_callback(struct timer_list *t) {
 	struct adios_data *ad = from_timer(ad, t, update_timer);
 
@@ -1454,7 +1455,7 @@ static int adios_init_sched(struct request_queue *q, struct elevator_type *e) {
 	spin_lock_init(&ad->barrier_lock);
 	INIT_LIST_HEAD(&ad->barrier_queue);
 
-	timer_setup(&ad->update_timer, update_timer_callback, 0);
+	timer_setup(&ad->update_timer, update_timer_callback, TIMER_DEFERRABLE);
 
 	ad->queue = q;
 	blk_stat_enable_accounting(q);

@@ -526,7 +526,7 @@ static unsigned int ssg_tgroup_shallow_depth(struct blk_mq_alloc_data *data)
 	if (!tgid)
 		return 0;
 
-	/* ponytail: O(n) scan on every congested allocation, per-tgid counter would be faster */
+	/* O(n) scan; per-tgid counter would be faster if congestion is frequent */
 	for (i = 0; i < nr_requests; i++)
 		if (tgid == ssg->rq_info[i].tgid)
 			tgroup_rqs++;
