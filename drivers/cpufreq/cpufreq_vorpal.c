@@ -1100,14 +1100,14 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 		fboost_ramp_pct = rfx_update_frame_boost_ramp(p, fboost_active, time);
 
 		/*
-		 * Idle gate: demand below 25% releases to idle floor.
-		 * Warmup bypasses the idle gate (demand hasn't appeared yet)
-		 * but does NOT pin to boost_fl — that cooked idle clusters.
-		 * Frame-boost ramp lifts the floor proportionally when a
-		 * frame-risk event fired on any cluster.
+		 * Idle clusters always release. During warmup, only a cluster
+		 * already carrying frame work gets the frame floor; this covers
+		 * launch/shader bursts without heating unrelated clusters.
 		 */
-		if (demand_pct < RFX_G_FLOOR_GATE_PCT && !warmup_active)
+		if (demand_pct < RFX_G_FLOOR_GATE_PCT)
 			fl = rfx_pct(fceil, RFX_G_IDLE_FLOOR_PCT);
+		else if (warmup_active)
+			fl = boost_fl;
 		else if (fboost_ramp_pct > 0 &&
 			 demand_pct >= RFX_G_BOOST_FOLLOW_PCT)
 			fl = fl + (boost_fl - fl) * fboost_ramp_pct / 100;
