@@ -118,11 +118,11 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  * the separate 700us gate and gaming remains on the 250us gate. */
 #define RFX_BIG_RATE_US			1500
 #define RFX_BIG_UP_US			0
-#define RFX_BIG_DOWN_US			6000
+#define RFX_BIG_DOWN_US			4000
 
 #define RFX_PRIME_RATE_US		1500
 #define RFX_PRIME_UP_US			0
-#define RFX_PRIME_DOWN_US		6000
+#define RFX_PRIME_DOWN_US		4000
 
 /*
  * Evaluation rate while gaming, or while the touch window is open. Frame pacing
@@ -280,6 +280,33 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  * the real demand rise and tracks it upward via headroom before the floor
  * matters. The floor's job is only the first ~2ms until demand is visible.
  */
+/*
+ * Daily Big/Prime frequency caps. Without these, background work (media
+ * scan, Google Play sync, indexers) can push Big/Prime to the top 1-2
+ * voltage steps — paying full high-OPP current for work the user does not
+ * perceive. The caps sit below the V/f knee's steep region so the cluster
+ * still covers all daily workloads (browsing, video decode, app launch)
+ * without hitting the expensive top OPPs.
+ *
+ * During a touch/UI window the cap lifts to RFX_D_*_BOOST_CAP_PCT so that
+ * scroll, keyboard popup and animation have headroom for burst ramps. The
+ * lift matches Little's pattern (68→80%) and ensures no UI jitter: the
+ * burst floor (45%/42%) is always below the lifted cap, so a cold-start
+ * never fights the cap during interaction.
+ *
+ * Sustained-load latch (same model as Little): if demand stays above
+ * RFX_D_BIG_LIFT_PCT the cap lifts to 95% so long-running foreground work
+ * (compile, heavy WebView) is not strangled. It drops back when demand
+ * falls below RFX_D_BIG_DROP_PCT.
+ */
+#define RFX_D_BIG_CAP_PCT		75
+#define RFX_D_BIG_BOOST_CAP_PCT		90
+#define RFX_D_PRIME_CAP_PCT		70
+#define RFX_D_PRIME_BOOST_CAP_PCT	85
+#define RFX_D_BIG_LIFT_PCT		65
+#define RFX_D_BIG_DROP_PCT		30
+#define RFX_D_BIG_SUSTAINED_CAP_PCT	95
+
 #define RFX_D_BIG_BURST_FLOOR_PCT	45
 #define RFX_D_PRIME_BURST_FLOOR_PCT	42
 
@@ -623,6 +650,7 @@ struct rfx_policy {
 
 	bool risk_high;			/* frame-risk edge state */
 	bool little_cap_lifted;		/* daily: sustained-load cap lift latch */
+	bool big_cap_lifted;		/* daily: sustained-load cap lift for Big/Prime */
 	bool thermal_cooling;		/* gaming: floors dropped to idle, hysteretic */
 
 };
@@ -1268,18 +1296,55 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 				if (freq < fl)
 					freq = fl;
 			}
-		} else if (coldstart_active) {
+		} else {
 			/*
-			 * Big and Prime differ only in floor percentage; the
-			 * two identical branches this replaces were a place
-			 * for one to be fixed and the other forgotten.
+			 * Big/Prime daily cap — same model as Little:
+			 *  - Base cap (75%/70%) keeps background work off the
+			 *    expensive top OPPs.
+			 *  - Touch/UI boost lifts cap (90%/85%) so scroll,
+			 *    keyboard and animation burst freely.
+			 *  - Sustained-load latch lifts to 95% for long
+			 *    foreground work (same hysteresis as Little).
+			 *  - Cold-start burst floor applied AFTER the cap,
+			 *    clamped to never exceed the cap — so burst
+			 *    responsiveness and power shaping coexist.
 			 */
-			unsigned int fl = rfx_pct(fceil, prime ?
-					RFX_D_PRIME_BURST_FLOOR_PCT :
-					RFX_D_BIG_BURST_FLOOR_PCT);
+			unsigned int cap, base_cap_pct, boost_cap_pct;
 
-			if (freq < fl)
-				freq = fl;
+			if (prime) {
+				base_cap_pct = RFX_D_PRIME_CAP_PCT;
+				boost_cap_pct = RFX_D_PRIME_BOOST_CAP_PCT;
+			} else {
+				base_cap_pct = RFX_D_BIG_CAP_PCT;
+				boost_cap_pct = RFX_D_BIG_BOOST_CAP_PCT;
+			}
+
+			cap = ui_active ?
+				rfx_pct(fceil, boost_cap_pct) :
+				rfx_pct(fceil, base_cap_pct);
+
+			/* Sustained-load latch (Big/Prime share one latch). */
+			if (demand_pct >= RFX_D_BIG_LIFT_PCT)
+				p->big_cap_lifted = true;
+			else if (demand_pct <= RFX_D_BIG_DROP_PCT)
+				p->big_cap_lifted = false;
+			if (p->big_cap_lifted)
+				cap = max(cap, rfx_pct(fceil,
+					RFX_D_BIG_SUSTAINED_CAP_PCT));
+
+			if (freq > cap)
+				freq = cap;
+
+			/* Cold-start burst floor, clamped to the cap. */
+			if (coldstart_active) {
+				unsigned int fl = rfx_pct(fceil, prime ?
+						RFX_D_PRIME_BURST_FLOOR_PCT :
+						RFX_D_BIG_BURST_FLOOR_PCT);
+
+				fl = min(fl, cap);
+				if (freq < fl)
+					freq = fl;
+			}
 		}
 	}
 
@@ -1876,6 +1941,7 @@ static void rfx_reset_all_policies(void)
 		p->gaming_warmup_end_ns = 0;
 		p->risk_high = false;
 		p->thermal_cooling = false;
+		p->big_cap_lifted = false;
 		/* Do not carry saturated gaming demand into the daily profile. */
 		p->filt_util = 0;
 		p->last_ema_ns = 0;
@@ -1918,6 +1984,7 @@ static ssize_t gaming_mode_store(struct gov_attr_set *attr_set,
 			p->gaming_warmup_end_ns = now + RFX_GAMING_WARMUP_NS;
 			/* Clear daily state so it cannot shape gaming decisions. */
 			p->little_cap_lifted = false;
+			p->big_cap_lifted = false;
 			p->ui_boost_end_ns = 0;
 			p->coldstart_boost_end_ns = 0;
 			p->prev_upct = 0;
@@ -2271,6 +2338,7 @@ static int rfx_start(struct cpufreq_policy *policy)
 	p->gaming_warmup_end_ns = 0;
 	p->risk_high = false;
 	p->little_cap_lifted = false;
+	p->big_cap_lifted = false;
 	p->thermal_cooling = false;
 
 	spin_lock_irqsave(&rfx_policy_list_lock, flags);
