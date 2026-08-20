@@ -702,6 +702,7 @@ struct rfx_policy {
 	u64 frame_boost_ramp_last_ns;		/* previous ramp evaluation */
 
 	u64 gaming_warmup_end_ns;	/* floor lift after gaming_mode=1 */
+	u64 gaming_warmup_start_ns;	/* arm time — anchors the absolute cap */
 
 	/*
 	 * Cluster-wide smoothed util. Owned by the policy, not by the CPU that
@@ -716,9 +717,6 @@ struct rfx_policy {
 	bool little_cap_lifted;		/* daily: sustained-load cap lift latch */
 	bool big_cap_lifted;		/* daily: sustained-load cap lift for Big/Prime */
 	bool thermal_cooling;		/* gaming: floors dropped to idle, hysteretic */
-
-	/* v2.2: consecutive frame miss escalation */
-	unsigned int consecutive_frame_misses;
 
 	/* v2.2: Little compositor ramp detection (gaming) */
 	u64 little_ramp_end_ns;
@@ -1054,8 +1052,8 @@ static inline bool rfx_frame_boost_active(u64 time)
 
 /*
  * Frame-risk detector. Arms one boost window when raw cluster demand crosses
- * RFX_RISK_SATURATION_PCT. Demand must fall below RISK_CLEAR_PCT before
- * another can arm. Little excluded.
+ * RFX_RISK_SATURATION_PCT. Demand must fall below RISK_CLEAR_PCT (or the
+ * boost window must expire) before another can arm. Little excluded.
  * Measures raw demand (before headroom inflation).
  */
 static void rfx_frame_risk_check(struct rfx_policy *p, unsigned int demand_pct,
@@ -1065,13 +1063,33 @@ static void rfx_frame_risk_check(struct rfx_policy *p, unsigned int demand_pct,
 		return;
 
 	if (demand_pct < RFX_RISK_SATURATION_PCT) {
-		if (demand_pct <= RFX_RISK_CLEAR_PCT)
+		/*
+		 * Clear risk_high on demand < clear OR boost window expired.
+		 * Without the expiry check, demand parked in (CLEAR, SATURATION)
+		 * - exactly where a busy game scene sits between frames - latches
+		 * risk_high forever after the first boost, so no later frame miss
+		 * can re-arm recovery until the scene falls below CLEAR. That is
+		 * the residual jank during sustained load. Re-arming is already
+		 * bounded to once per window by the rfx_frame_boost_active() and
+		 * next_freq >= boost_fl gates below, so this cannot oscillate.
+		 */
+		if (demand_pct <= RFX_RISK_CLEAR_PCT ||
+		    !rfx_frame_boost_active(time))
 			p->risk_high = false;
 		return;
 	}
 
-	if (p->risk_high)
-		return;
+	/*
+	 * Sustained saturation may outlive one boost window. Let the latch
+	 * re-arm after expiry when the cluster still has clock left to gain;
+	 * otherwise one crossing permanently disables recovery until demand
+	 * falls below CLEAR.
+	 */
+	if (p->risk_high) {
+		if (rfx_frame_boost_active(time))
+			return;
+		p->risk_high = false;
+	}
 
 	/*
 	 * Nothing to gain: this cluster is already committed at or above the
@@ -1110,9 +1128,7 @@ static void rfx_frame_risk_check(struct rfx_policy *p, unsigned int demand_pct,
 
 		if (new_end - time <= RFX_FRAME_BOOST_MAX_NS)
 			atomic64_set(&rfx_frame_boost_end_ns, new_end);
-		p->consecutive_frame_misses++;
 	} else {
-		p->consecutive_frame_misses = 1;
 		atomic64_set(&rfx_frame_boost_end_ns, time + RFX_FRAME_BOOST_NS);
 	}
 }
@@ -1205,12 +1221,13 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 		 */
 		if (warmup_active && !little) {
 			if (demand_pct >= RFX_GAMING_WARMUP_EXTEND_PCT) {
-				u64 cap = p->gaming_warmup_end_ns +
-					  RFX_GAMING_WARMUP_MAX_NS -
-					  RFX_GAMING_WARMUP_NS;
+				u64 cap = p->gaming_warmup_start_ns +
+					  RFX_GAMING_WARMUP_MAX_NS;
 				u64 ext = time + RFX_EMA_DECAY_PERIOD_NS * 4;
 
-				if (ext < cap && ext > p->gaming_warmup_end_ns)
+				if (ext > cap)
+					ext = cap;
+				if (ext > p->gaming_warmup_end_ns)
 					p->gaming_warmup_end_ns = ext;
 				p->warmup_low_demand_since_ns = 0;
 			} else if (demand_pct < RFX_GAMING_WARMUP_RELEASE_PCT) {
@@ -2111,10 +2128,10 @@ static void rfx_reset_all_policies(void)
 		p->frame_boost_ramp_pct = 0;
 		p->frame_boost_ramp_last_ns = 0;
 		p->gaming_warmup_end_ns = 0;
+		p->gaming_warmup_start_ns = 0;
 		p->risk_high = false;
 		p->thermal_cooling = false;
 		p->big_cap_lifted = false;
-		p->consecutive_frame_misses = 0;
 		p->little_ramp_end_ns = 0;
 		p->prev_gaming_demand_pct = 0;
 		p->warmup_low_demand_since_ns = 0;
@@ -2158,6 +2175,7 @@ static ssize_t gaming_mode_store(struct gov_attr_set *attr_set,
 			p->need_freq_update = true;
 			/* Warmup floor lift covers process spawn / asset load. */
 			p->gaming_warmup_end_ns = now + RFX_GAMING_WARMUP_NS;
+			p->gaming_warmup_start_ns = now;
 			/* Clear daily state so it cannot shape gaming decisions. */
 			p->little_cap_lifted = false;
 			p->big_cap_lifted = false;
@@ -2168,7 +2186,6 @@ static ssize_t gaming_mode_store(struct gov_attr_set *attr_set,
 			/* Stale latches from a previous session. */
 			p->risk_high = false;
 			p->thermal_cooling = false;
-			p->consecutive_frame_misses = 0;
 			p->little_ramp_end_ns = 0;
 			p->prev_gaming_demand_pct = 0;
 			p->warmup_low_demand_since_ns = 0;
@@ -2516,11 +2533,11 @@ static int rfx_start(struct cpufreq_policy *policy)
 	p->frame_boost_ramp_pct = 0;
 	p->frame_boost_ramp_last_ns = 0;
 	p->gaming_warmup_end_ns = 0;
+	p->gaming_warmup_start_ns = 0;
 	p->risk_high = false;
 	p->little_cap_lifted = false;
 	p->big_cap_lifted = false;
 	p->thermal_cooling = false;
-	p->consecutive_frame_misses = 0;
 	p->little_ramp_end_ns = 0;
 	p->prev_gaming_demand_pct = 0;
 	p->warmup_low_demand_since_ns = 0;
