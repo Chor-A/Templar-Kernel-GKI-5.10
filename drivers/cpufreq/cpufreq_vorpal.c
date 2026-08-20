@@ -1002,11 +1002,13 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 	 * channel this governor was not reading.
 	 */
 	unsigned int fceil;
+	unsigned int fceil_pct;
 
 	if (unlikely(!fmax || !max_cap))
 		return pol->cur;
 
-	fceil = rfx_pct(fmax, rfx_thermal_headroom_pct(pol, max_cap));
+	fceil_pct = rfx_thermal_headroom_pct(pol, max_cap);
+	fceil = rfx_pct(fmax, fceil_pct);
 	fceil = clamp(fceil, fmin, fmax);
 
 	util = rfx_apply_headroom(util, max_cap, gaming, little);
@@ -1062,6 +1064,20 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 		} else {			/* Little: compositor / audio / input */
 			fl = rfx_pct(fceil, RFX_G_LITTLE_FLOOR_PCT);
 			boost_fl = rfx_pct(fceil, RFX_G_LITTLE_FLOOR_BOOST_PCT);
+		}
+
+		/*
+		 * Once the platform has already removed >=15% capacity, holding
+		 * gaming floors or a global frame boost defeats thermal relief and
+		 * makes the hardware limiter saw-tooth the clock. Let every cluster
+		 * cool to the idle floor; normal demand and up-rate remain intact.
+		 */
+		if (fceil_pct < 85) {
+			unsigned int cool_floor = rfx_pct(fceil,
+							 RFX_G_IDLE_FLOOR_PCT);
+
+			fl = min(fl, cool_floor);
+			boost_fl = min(boost_fl, cool_floor);
 		}
 
 		/*
