@@ -504,6 +504,25 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  */
 #define RFX_G_IDLE_FLOOR_PCT		38
 
+/*
+ * Thermal cool-down band for the gaming floors, with hysteresis. When the
+ * effective ceiling drops below RFX_G_COOL_ENTER_PCT the platform limiter is
+ * already taking capacity, so holding the frame floors (or a global boost)
+ * only fights it and makes the hardware saw-tooth the clock; both floors fall
+ * to the idle floor and let the die cool. The floors do not come back until
+ * the ceiling has recovered to RFX_G_COOL_EXIT_PCT.
+ *
+ * The gap matters: a single-threshold test at 85% collapses the frame floor
+ * from ~70% to 38% the instant the ceiling crosses one OPP boundary, and the
+ * vendor thermal HAL steps policy->max across that boundary continuously under
+ * load - so the floor toggled 70<->38 every HAL adjustment, which is a clock
+ * sag and a dropped frame each time. That is the early-game jitter on a title
+ * that heats fast (asset/shader load spikes the ceiling down, then it lifts).
+ * A 5-point deadband turns that oscillation into one entry and one exit.
+ */
+#define RFX_G_COOL_ENTER_PCT		85
+#define RFX_G_COOL_EXIT_PCT		90
+
 #define IOWAIT_BOOST_MIN		(SCHED_CAPACITY_SCALE / 8)
 
 /* ===================================================================== */
@@ -604,6 +623,7 @@ struct rfx_policy {
 
 	bool risk_high;			/* frame-risk edge state */
 	bool little_cap_lifted;		/* daily: sustained-load cap lift latch */
+	bool thermal_cooling;		/* gaming: floors dropped to idle, hysteretic */
 
 };
 
@@ -1067,12 +1087,19 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 		}
 
 		/*
-		 * Once the platform has already removed >=15% capacity, holding
-		 * gaming floors or a global frame boost defeats thermal relief and
-		 * makes the hardware limiter saw-tooth the clock. Let every cluster
-		 * cool to the idle floor; normal demand and up-rate remain intact.
+		 * Once the platform has already removed capacity, holding gaming
+		 * floors or a global frame boost defeats thermal relief and makes
+		 * the hardware limiter saw-tooth the clock. Let every cluster cool
+		 * to the idle floor; normal demand and up-rate remain intact. The
+		 * entry/exit split (see RFX_G_COOL_ENTER_PCT) gives this a deadband
+		 * so a ceiling hovering on an OPP boundary cannot toggle the floors.
 		 */
-		if (fceil_pct < 85) {
+		if (fceil_pct < RFX_G_COOL_ENTER_PCT)
+			p->thermal_cooling = true;
+		else if (fceil_pct >= RFX_G_COOL_EXIT_PCT)
+			p->thermal_cooling = false;
+
+		if (p->thermal_cooling) {
 			unsigned int cool_floor = rfx_pct(fceil,
 							 RFX_G_IDLE_FLOOR_PCT);
 
@@ -1848,6 +1875,7 @@ static void rfx_reset_all_policies(void)
 		p->frame_boost_ramp_last_ns = 0;
 		p->gaming_warmup_end_ns = 0;
 		p->risk_high = false;
+		p->thermal_cooling = false;
 		/* Do not carry saturated gaming demand into the daily profile. */
 		p->filt_util = 0;
 		p->last_ema_ns = 0;
@@ -1894,8 +1922,9 @@ static ssize_t gaming_mode_store(struct gov_attr_set *attr_set,
 			p->coldstart_boost_end_ns = 0;
 			p->prev_upct = 0;
 			p->prev_upct_ns = 0;
-			/* Stale risk latch from a previous session. */
+			/* Stale latches from a previous session. */
 			p->risk_high = false;
+			p->thermal_cooling = false;
 			raw_spin_unlock_irqrestore(&p->update_lock, pflags);
 		}
 		spin_unlock_irqrestore(&rfx_policy_list_lock, flags);
@@ -2242,6 +2271,7 @@ static int rfx_start(struct cpufreq_policy *policy)
 	p->gaming_warmup_end_ns = 0;
 	p->risk_high = false;
 	p->little_cap_lifted = false;
+	p->thermal_cooling = false;
 
 	spin_lock_irqsave(&rfx_policy_list_lock, flags);
 	list_add(&p->gov_node, &rfx_policy_list);
