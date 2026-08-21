@@ -127,13 +127,12 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
 #define RFX_GAMING_DOWN_US		4000
 
 /* Gaming frequency band, percent of the effective ceiling. floor/frame gap
- * is what the clock hunts between frames: too wide and inter-frame dips cost
- * a frame on the ramp back, too narrow and it holds frame voltage through
- * idle gaps. 70/88 (Prime) and 66/86 (Big) keep it within ~1 OPP step of the
- * frame target; sustained-load headroom handles benchmark sustain. */
-#define RFX_G_PRIME_FLOOR_PCT		70
+ * is what the clock hunts between frames; wider band = lower idle heat at
+ * cost of one extra OPP step on the recovery ramp, which the bounded slew
+ * absorbs. Frame (boost) floors stay high for real frame-miss recovery. */
+#define RFX_G_PRIME_FLOOR_PCT		62
 #define RFX_G_PRIME_FRAME_PCT		88
-#define RFX_G_BIG_FLOOR_PCT		66
+#define RFX_G_BIG_FLOOR_PCT		58
 #define RFX_G_BIG_FRAME_PCT		86
 /* Little at 55%: compositor, input and audio live here during gameplay at
  * ~30-40% demand; 55% holds the floor through inter-frame dips. Boost 74%
@@ -215,14 +214,17 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
 #define RFX_HEADROOM_DAILY_HIGH		4
 #define RFX_HEADROOM_DAILY_MID		2
 /* Gaming headroom, added on top of the 25% margin so a saturating load lands
- * on an OPP with room to spare -- this (not a high floor) sustains fmax, since
- * it scales with demand. 12% = ~37% total; higher locks fmax on moderate scenes
- * and wastes thermal budget. */
-#define RFX_HEADROOM_GAMING		12
+ * on an OPP with room to spare. 8% = ~33% total; covers PELT decay lag without
+ * inflating moderate scenes to fmax territory (the old 12% did, burning thermal
+ * budget on steady-state scenes that sat at 60-70% demand). */
+#define RFX_HEADROOM_GAMING		8
 
 /* Util percent at which we stop interpolating and request fmax outright.
- * Gaming 82% for frame protection; daily 95% (last OPP is a battery cost). */
-#define RFX_SAT_TO_MAX_GAMING_PCT	82
+ * Gaming 88%: with the 25% DVFS margin, raw ~70% already reads ~88%; below
+ * this, headroom alone scales the OPP correctly. The old 82% locked fmax on
+ * moderate scenes (raw ~66%) and sustained heat. Daily 95%: last OPP is a
+ * battery cost. */
+#define RFX_SAT_TO_MAX_GAMING_PCT	88
 #define RFX_SAT_TO_MAX_DAILY_PCT	95
 
 /* ---- Thermal emergency net. HW LMH + vendor HAL are the real controllers
@@ -303,11 +305,10 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
 /* Thermal cool-down band for the gaming floors, hysteretic. Below ENTER the
  * platform limiter is already taking capacity, so floors drop to the idle floor
  * and stop fighting it; they return only once the ceiling recovers to EXIT. The
- * 5-point deadband stops the floor toggling 70<->38 as the HAL steps policy->max
- * across an OPP boundary under load (the early-game jitter on fast-heating
- * titles). */
-#define RFX_G_COOL_ENTER_PCT		85
-#define RFX_G_COOL_EXIT_PCT		90
+ * 5-point deadband stops the floor toggling as the HAL steps policy->max across
+ * an OPP boundary under load. */
+#define RFX_G_COOL_ENTER_PCT		80
+#define RFX_G_COOL_EXIT_PCT		85
 
 #define IOWAIT_BOOST_MIN		(SCHED_CAPACITY_SCALE / 8)
 
@@ -594,25 +595,11 @@ static unsigned long rfx_ema(unsigned long old, unsigned long val,
 	if (val >= old)
 		return val;	/* instant rise */
 
-	/*
-	 * Daily: 1/4 decay per period, max 4 steps. Replaces the old instant
-	 * fall that chased every PELT micro-dip, causing an OPP transition
-	 * (2-5mA switching energy) per eval. ~1ms of smoothing is invisible
-	 * against PELT's ~32ms half-life, and the rate gate still bounds commits.
-	 */
-	if (!gaming) {
-		steps = (unsigned int)min_t(u64,
-				delta_ns / RFX_EMA_DECAY_PERIOD_NS, 4);
-		if (!steps)
-			return old;
-		while (steps--) {
-			diff = old - val;
-			if (!diff)
-				break;
-			old -= max_t(unsigned long, diff / 4, 1);
-		}
-		return old;
-	}
+	/* Daily: instant fall. Gentle decay rode the peak of bursty light loads
+	 * (scroll/video), pinning a high resting OPP through inter-frame dips;
+	 * the down-rate gate already bounds churn. Gaming keeps the decay below. */
+	if (!gaming)
+		return val;
 
 	/*
 	 * Gaming: 1/8 per period, or 1/16 during a frame boost window -- halving
