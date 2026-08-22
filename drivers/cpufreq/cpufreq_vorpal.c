@@ -216,11 +216,11 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
 #define RFX_HEADROOM_GAMING		8
 
 /* Util percent at which we stop interpolating and request fmax outright.
- * Gaming 88%: with the 25% DVFS margin, raw ~70% already reads ~88%; below
- * this, headroom alone scales the OPP correctly. The old 82% locked fmax on
- * moderate scenes (raw ~66%) and sustained heat. Daily 95%: last OPP is a
- * battery cost. */
-#define RFX_SAT_TO_MAX_GAMING_PCT	88
+ * Gaming 92%: with the 25% DVFS margin, only a true ~74% demand reads this
+ * high, so steady ~70% scenes ride demand+headroom instead of pinning fmax
+ * (88% still locked those -- part of the gaming power/idle overshoot). Below
+ * this, headroom alone scales the OPP. Daily 95%: last OPP is a battery cost. */
+#define RFX_SAT_TO_MAX_GAMING_PCT	92
 #define RFX_SAT_TO_MAX_DAILY_PCT	95
 
 /* ---- Thermal emergency net. HW LMH + vendor HAL are the real controllers
