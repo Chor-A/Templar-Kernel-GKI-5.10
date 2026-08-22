@@ -115,10 +115,11 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  * gesture tracking are the only sub-ms DVFS needs, both bounded events. */
 #define RFX_FAST_RATE_US		250
 
-/* Eval rate during a DAILY interaction window. 700us: a daily scroll only
- * needs the util rise seen promptly (PELT moves ~0.5%/250us), so 250us here
- * would just burn CPU for the whole 280ms post-touch window. */
-#define RFX_UI_RATE_US			700
+/* Eval rate during a DAILY interaction window. 900us: a daily scroll only
+ * needs the util rise seen promptly (PELT moves ~0.5%/250us), so a finer rate
+ * would just burn CPU for the whole post-touch window; 900us trims wakeup
+ * current across the window vs the old 700us with no perceptible scroll lag. */
+#define RFX_UI_RATE_US			900
 
 /* Gaming down-rate gate. Gates every downward commit, so it sets descent
  * granularity: step = RFX_GAMING_DOWN_PCT_PER_MS * this. Must be chosen with
@@ -166,9 +167,9 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  * for long foreground work, releasing below DROP_PCT.
  */
 #define RFX_D_BIG_CAP_PCT		75
-#define RFX_D_BIG_BOOST_CAP_PCT		90
+#define RFX_D_BIG_BOOST_CAP_PCT		85
 #define RFX_D_PRIME_CAP_PCT		70
-#define RFX_D_PRIME_BOOST_CAP_PCT	85
+#define RFX_D_PRIME_BOOST_CAP_PCT	80
 #define RFX_D_BIG_LIFT_PCT		65
 #define RFX_D_BIG_DROP_PCT		30
 #define RFX_D_BIG_SUSTAINED_CAP_PCT	95
@@ -189,8 +190,9 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  * false-firing on background/sensor work. */
 #define RFX_D_COLDSTART_DELTA_PCT	40
 #define RFX_D_COLDSTART_BASE_PCT	10
-/* UI boost 280ms: covers animation (150-200ms) plus scroll-momentum tail. */
-#define RFX_D_UI_BOOST_NS		(280 * NSEC_PER_MSEC)
+/* UI boost 220ms: covers animation (150-200ms); scroll-momentum tail trimmed
+ * to cut the boost-cap hold under continuous scrolling (daily heat). */
+#define RFX_D_UI_BOOST_NS		(220 * NSEC_PER_MSEC)
 /* Cold-start boost 200ms: spawn + initial layout + first render. */
 #define RFX_D_COLDSTART_BOOST_NS	(200 * NSEC_PER_MSEC)
 
@@ -1014,7 +1016,7 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 				rfx_pct(fceil, RFX_D_LITTLE_CAP_PCT);
 
 			/*
-			 * Sustained heavy load relaxes the cap: the 68%
+			 * Sustained heavy load relaxes the cap: the 65%
 			 * battery cap otherwise strangles every long
 			 * multithread workload (compile, media scan,
 			 * untouched-screen game) once the touch and burst
@@ -1688,6 +1690,7 @@ static void rfx_reset_all_policies(void)
 		p->gaming_warmup_start_ns = 0;
 		p->risk_high = false;
 		p->thermal_cooling = false;
+		p->little_cap_lifted = false;
 		p->big_cap_lifted = false;
 		p->little_ramp_end_ns = 0;
 		p->prev_gaming_demand_pct = 0;
