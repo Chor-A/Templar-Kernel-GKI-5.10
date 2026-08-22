@@ -37,7 +37,6 @@
  *   • Little Compositor Ramp (v2.2)     	— 15-point rise detection for gaming compositor spikes
  *   • Adaptive Gaming Warmup (v2.2)     	— Demand-driven extend/release, cap 1500ms
  *   • Daily EMA Gentle Decay (v2.2)     	— 1/4-per-period smoothing, cuts OPP churn ~50%
- *   • Big Interaction Floor (v2.2)       	— 20% UI floor eliminates scroll ramp jitter
  *   • Faster Daily Down-Rate (v2.2)     	— 2500µs Big/Prime for quicker idle transitions
  *   • Adaptive Thermal Polling (v2.2)   	— Warm tier at 70°C polls 2s instead of 5s
  *
@@ -146,17 +145,14 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
 #define RFX_GAMING_DOWN_PCT_PER_MS	1
 
 /* ---- Daily frequency shaping, percent of the effective ceiling ---- */
-/* Little daily cap 68%: sits just above the V/f knee so light scrolling
+/* Little daily cap 65%: sits just above the V/f knee so light scrolling
  * stays on one voltage step instead of toggling across it. */
-#define RFX_D_LITTLE_CAP_PCT		68
+#define RFX_D_LITTLE_CAP_PCT		65
 #define RFX_D_LITTLE_BOOST_CAP_PCT	80
 /* Little interaction floor, window-scoped (no touch/UI burst → no floor).
  * Holds Little off fmin between scroll frames so each frame doesn't start at
  * ~300MHz waiting for DVFS. 32% is one voltage step below the knee. */
 #define RFX_D_LITTLE_UI_FLOOR_PCT	32
-/* Big interaction floor, window-scoped. Same purpose as Little's; 20% is
- * below the V/f knee. Prime gets none (not a UI cluster). */
-#define RFX_D_BIG_UI_FLOOR_PCT		20
 /* Little sustained-load cap 80%: knee sits at 75-80%, so long background
  * work (media scan, sync) keeps throughput at lower voltage. */
 #define RFX_D_LITTLE_SUSTAINED_CAP_PCT	80
@@ -1096,21 +1092,6 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 						RFX_D_BIG_BURST_FLOOR_PCT);
 
 				fl = min(fl, cap);
-				if (freq < fl)
-					freq = fl;
-			}
-
-			/*
-			 * Interaction floor for Big only: Big carries render
-			 * threads migrating up from Little, so a small touch-window
-			 * floor keeps the first migrated frame off fmin. Prime is
-			 * not a UI cluster -- its cap-lift and cold-start burst
-			 * already cover real bursts, so it gets no standing floor.
-			 */
-			if (ui_active && !prime) {
-				unsigned int fl = min(cap,
-					rfx_pct(fceil, RFX_D_BIG_UI_FLOOR_PCT));
-
 				if (freq < fl)
 					freq = fl;
 			}
