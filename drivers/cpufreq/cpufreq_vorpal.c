@@ -98,10 +98,11 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  * is what the clock hunts between frames; narrow band keeps inter-frame clock
  * high so a landing frame recovers in fewer OPP steps — needed at 120fps where
  * the 8.3ms budget can't absorb a wide recovery ramp. Frame (boost) floors
- * stay high for real frame-miss recovery. Prime 72: narrows the hunt band one
- * step further (OPP-selection sim: prime-cluster clock changes -16..27% vs 70,
- * +1.6% power) since prime carries the heaviest frame threads. */
-#define RFX_G_PRIME_FLOOR_PCT		72
+ * stay high for real frame-miss recovery. Prime 78: render is the only cluster
+ * with ceiling headroom to sag, so a low floor sawtoothed it to ~63% between
+ * frames (the 120fps jank); 78 holds it frame-capable, still under the 92 frame
+ * floor so the risk detector keeps arming. */
+#define RFX_G_PRIME_FLOOR_PCT		78
 #define RFX_G_PRIME_FRAME_PCT		92
 #define RFX_G_BIG_FLOOR_PCT		66
 #define RFX_G_BIG_FRAME_PCT		90
@@ -246,10 +247,11 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
 
 /* Gaming floor demand gate: below this util a cluster's floor releases and
  * normal DVFS applies, so an idle cluster doesn't burn floor voltage as heat.
- * 25% keeps every working cluster (compositor on Little lives at 30-40%) on the
- * stable base floor while releasing truly idle ones; a boost/heavy scene
- * overrides the gate. */
-#define RFX_G_FLOOR_GATE_PCT		25
+ * 18% keeps working clusters on the base floor while releasing truly idle ones.
+ * Was 25: a bursty render thread's EMA dips to ~22% between frames, tripping the
+ * idle collapse and sawtoothing the clock; 18 sits below that dip so the base
+ * floor holds across frames. A boost/heavy scene overrides the gate. */
+#define RFX_G_FLOOR_GATE_PCT		18
 
 /* Demand a cluster must show to follow the GLOBAL (shared) frame boost up to its
  * frame floor. Without this, one cluster's risk crossing would hold all three at
