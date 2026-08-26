@@ -215,10 +215,10 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
 #define RFX_SAT_TO_MAX_GAMING_PCT	90
 #define RFX_SAT_TO_MAX_DAILY_PCT	95
 
-/* ---- Thermal emergency net. HW LMH + vendor HAL are the real controllers
- * (they lower policy->max, which the gaming band follows via fceil). This is a
- * single hard net for when the vendor engine is absent/asleep: one trip, one
- * release, 7C apart, so it cannot oscillate. */
+/* ---- Thermal emergency net. HW LMH (via thermal_pressure/fceil) + vendor HAL
+ * (via core-enforced policy->max) are the real controllers. This is a single
+ * hard net for when the vendor engine is absent/asleep: one trip, one release,
+ * 7C apart, so it cannot oscillate. */
 #define RFX_THERMAL_POLL_GAMING_MS	100
 /* Idle poll: die time constant is ~seconds; 5s detects runaway in <2 constants.
  * Work is deferrable (free in deep sleep), so this only trims screen-on-idle
@@ -469,27 +469,16 @@ static inline unsigned int rfx_pct(unsigned int fmax, unsigned int pct)
 }
 
 /*
- * Thermal headroom for this policy, 0..100. 100 = nothing holding the cluster
- * below its hardware ceiling. Two channels, since platforms disagree on which:
- *   policy->max  - lowered via freq_qos by cpufreq_cooling / vendor thermal /
- *                  userspace HAL. What MediaTek and most AOSP/OOS stacks drive.
- *   thermal      - arch_scale_thermal_pressure(): capacity taken away, incl. by
- *   pressure       HW limiters (QCOM LMH) that throttle WITHOUT touching
- *                  policy->max, so the policy over-claims its ceiling.
- * min() is not a double count: cpufreq_cooling derives both from the same
- * requested freq, so when both are live they agree and min() is a no-op; when
- * only one is live, min() is the only way to see it.
+ * Thermal headroom 0..100, from thermal_pressure only (LMH-style throttle the
+ * core can't see). policy->max is NOT folded in -- the core enforces it on
+ * commit, and a non-thermal baseline below fmax (MTK) would compound with the
+ * % caps and halve the usable range.
  */
 static unsigned int rfx_thermal_headroom_pct(struct cpufreq_policy *pol,
 					     unsigned long max_cap)
 {
-	unsigned int fmax = pol->cpuinfo.max_freq;
-	unsigned int pmax = READ_ONCE(pol->max);
-	unsigned int qos_pct = 100, press_pct = 100;
+	unsigned int press_pct = 100;
 	unsigned long press;
-
-	if (fmax && pmax && pmax < fmax)
-		qos_pct = (unsigned int)((u64)pmax * 100 / fmax);
 
 	press = arch_scale_thermal_pressure(cpumask_first(pol->related_cpus));
 	if (max_cap) {
@@ -500,7 +489,7 @@ static unsigned int rfx_thermal_headroom_pct(struct cpufreq_policy *pol,
 						   100 / max_cap);
 	}
 
-	return min(qos_pct, press_pct);
+	return press_pct;
 }
 
 /*
@@ -667,9 +656,9 @@ static unsigned long rfx_apply_headroom(unsigned long util, unsigned long max_ca
 /*
  * Last clamp before OPP resolution. A flat, latched cap - no walking, no
  * proportional target, no per-cluster stepping. Normal throttling is the
- * platform's job (LMH / thermal HAL lower policy->max, and the gaming band
- * tracks that through fceil); this only fires if the die reaches
- * RFX_TEMP_EMERGENCY_MC, which on a healthy device never happens.
+ * platform's job (LMH via thermal_pressure/fceil, thermal HAL via core-enforced
+ * policy->max); this only fires if the die reaches RFX_TEMP_EMERGENCY_MC, which
+ * on a healthy device never happens.
  */
 static unsigned int rfx_thermal_clamp(unsigned int freq, unsigned int fmax)
 {
