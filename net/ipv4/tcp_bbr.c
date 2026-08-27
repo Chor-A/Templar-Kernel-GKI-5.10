@@ -885,10 +885,10 @@ static void bbr_check_probe_rtt_done(struct sock *sk)
  *
  * The min_rtt filter window is 10 seconds. When the min_rtt estimate expires,
  * we enter PROBE_RTT mode and cap the cwnd at bbr_cwnd_min_target=4 packets.
- * After at least bbr_probe_rtt_mode_ms=200ms and at least one packet-timed
+ * After at least bbr_probe_rtt_mode_ms=140ms and at least one packet-timed
  * round trip elapsed with that flight size <= 4, we leave PROBE_RTT mode and
- * re-enter the previous mode. BBR uses 200ms to approximately bound the
- * performance penalty of PROBE_RTT's cwnd capping to roughly 2% (200ms/10s).
+ * re-enter the previous mode. 140ms (tuned down from the stock 200ms) bounds
+ * the PROBE_RTT cwnd-capping penalty to roughly 1.4% (140ms/10s).
  *
  * Note that flows need only pay 2% if they are busy sending over the last 10
  * seconds. Interactive applications (e.g., Web, RPCs, video chunks) often have
