@@ -200,19 +200,23 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  * real frame, so this only lowers the resting OPP. */
 #define RFX_HEADROOM_DAILY_HIGH		4
 #define RFX_HEADROOM_DAILY_MID		2
-/* Gaming headroom on top of the 25% margin. 8% (~33% total) is the steady-state
- * power lever -- applied every eval, so it sets the resting OPP. 10% pushed
- * average power off the 5.9W target for no FPS gain (heavy frames reach fmax via
- * the saturation shortcut regardless of headroom). */
-#define RFX_HEADROOM_GAMING		8
+/* Gaming headroom on top of the 25% margin. Applied every eval, so it sets the
+ * resting OPP -- the steady-state power lever. 8% (~33% total) kept the 70-85%
+ * game load pinned at fmax (measured 6.64W / 62.9% CPU): 72% real x1.25 margin
+ * = 90%, +8% = 98% >= the saturation trigger. 5% (~30% total) lets that band
+ * interpolate below the top OPP; heavy frames still reach fmax via the
+ * saturation shortcut regardless of headroom. */
+#define RFX_HEADROOM_GAMING		5
 
 /* Util percent at which we stop interpolating and request fmax outright.
- * Gaming 90%: with the envelope filter the reading is a scene measure rather
- * than a per-frame spike, so an early shortcut now buys fmax excursions for
- * frames that were not going to miss -- the 88 that was tuned against the
- * churning filter reads ~2 points hotter for no FPS. Heavy frames still reach
- * fmax; only the trigger point moved. Daily 95%: last OPP is a battery cost. */
-#define RFX_SAT_TO_MAX_GAMING_PCT	90
+ * Gaming 95%: at 90, every 70-85% frame (x1.25 margin -> 87-106% inflated)
+ * shortcut straight to fmax, pinning Big/Prime at the top OPP the whole session
+ * (the 7W / flat-2500 trace). 95 lets the 70-79% band interpolate down one or
+ * two OPPs; >=80% real demand still inflates past 95 and saturates, so heavy
+ * frames reach fmax unchanged -- only the resting point moved. The envelope
+ * filter makes the reading a scene measure, not a per-frame spike, so this does
+ * not chatter. Daily 95%: last OPP is a battery cost. */
+#define RFX_SAT_TO_MAX_GAMING_PCT	95
 #define RFX_SAT_TO_MAX_DAILY_PCT	95
 
 /* ---- Thermal emergency net. HW LMH (via thermal_pressure/fceil) + vendor HAL
