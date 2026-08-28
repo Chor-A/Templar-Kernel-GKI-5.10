@@ -104,13 +104,20 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  * ~2.3GHz of X2 voltage for the whole session. */
 #define RFX_G_PRIME_FLOOR_PCT		72
 #define RFX_G_PRIME_FRAME_PCT		92
-#define RFX_G_BIG_FLOOR_PCT		66
+#define RFX_G_BIG_FLOOR_PCT		84
 #define RFX_G_BIG_FRAME_PCT		90
-/* Little at 60%: compositor, input and audio live here during gameplay at
- * ~30-40% demand; 60% holds the floor through inter-frame dips. Boost 80%
- * for frame-miss recovery. */
-#define RFX_G_LITTLE_FLOOR_PCT		60
-#define RFX_G_LITTLE_FLOOR_BOOST_PCT	80
+/* Gaming ceiling per perf cluster (% of fceil, applied as a hard min() last).
+ * Prime+Big ride a 2100-2400MHz band: floor..cap caps the X2/A710 top OPPs (the
+ * heat cliff) without lowering fceil, so platform LMH still owns real
+ * throttling. Portable: % of each SoC's fmax. Frame floors stay high and are
+ * clamped to the cap at runtime, so widening the cap restores frame headroom. */
+#define RFX_G_PRIME_CAP_PCT		82
+#define RFX_G_BIG_CAP_PCT		96
+/* Little pinned high during gaming (compositor/input/audio). Floor 85 holds it
+ * near-max whenever it has work; the 25% idle gate still releases a truly idle
+ * Little to RFX_G_IDLE_FLOOR_PCT. Uncapped — rides to fceil. */
+#define RFX_G_LITTLE_FLOOR_PCT		85
+#define RFX_G_LITTLE_FLOOR_BOOST_PCT	90
 
 /* Max downward slew, percent of ceiling per ms elapsed (time-proportional,
  * not per-update, since update spacing varies with load). 1%/ms sheds a full
@@ -784,7 +791,7 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 	if (gaming) {
 		bool fboost_active, warmup_active;
 		unsigned int fboost_ramp_pct;
-		unsigned int fl, boost_fl, demand_pct;
+		unsigned int fl, boost_fl, gcap, demand_pct;
 		u64 down_step, slew_ns;
 
 		/*
@@ -843,13 +850,25 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 		if (prime) {
 			fl = rfx_pct(fceil, RFX_G_PRIME_FLOOR_PCT);
 			boost_fl = rfx_pct(fceil, RFX_G_PRIME_FRAME_PCT);
+			gcap = rfx_pct(fceil, RFX_G_PRIME_CAP_PCT);
 		} else if (!little) {		/* Big: carries most load */
 			fl = rfx_pct(fceil, RFX_G_BIG_FLOOR_PCT);
 			boost_fl = rfx_pct(fceil, RFX_G_BIG_FRAME_PCT);
+			gcap = rfx_pct(fceil, RFX_G_BIG_CAP_PCT);
 		} else {			/* Little: compositor / audio / input */
 			fl = rfx_pct(fceil, RFX_G_LITTLE_FLOOR_PCT);
 			boost_fl = rfx_pct(fceil, RFX_G_LITTLE_FLOOR_BOOST_PCT);
+			gcap = fceil;		/* pinned high, no cap below ceiling */
 		}
+
+		/*
+		 * Prime/Big gaming ceiling. Clamp the floors to it too, so the
+		 * frame-risk detector and boost ramp target the reachable clock
+		 * instead of a floor sitting above the cap.
+		 */
+		gcap = max(gcap, fmin);
+		fl = min(fl, gcap);
+		boost_fl = min(boost_fl, gcap);
 
 		/*
 		 * Once the platform has removed capacity, holding gaming floors or
@@ -937,6 +956,10 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 		if (little && p->little_ramp_end_ns && time < p->little_ramp_end_ns &&
 		    freq < boost_fl)
 			freq = boost_fl;
+
+		/* Hard gaming ceiling (Prime/Big band; no-op for Little). */
+		if (freq > gcap)
+			freq = gcap;
 	} else {
 		bool ui_active, coldstart_active;
 		unsigned int demand_pct;
