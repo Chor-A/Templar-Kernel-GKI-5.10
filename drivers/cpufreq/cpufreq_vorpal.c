@@ -94,24 +94,23 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  * the slew bound; 4ms (half a 120fps frame) * 1%/ms = 4% max step. */
 #define RFX_GAMING_DOWN_US		4000
 
-/* Gaming frequency band, percent of the effective ceiling. floor/frame gap
- * is what the clock hunts between frames; narrow band keeps inter-frame clock
- * high so a landing frame recovers in fewer OPP steps — needed at 120fps where
- * the 8.3ms budget can't absorb a wide recovery ramp. Frame (boost) floors
- * stay high for real frame-miss recovery. Prime 72: the envelope filter, not a
- * static floor, is what holds the render clock between frames, so this only has
- * to cover a cold landing. Raising it to 78 to fight the sawtooth just paid
- * ~2.3GHz of X2 voltage for the whole session. */
+/* Gaming floors, percent of the effective ceiling. NO cluster is capped: every
+ * cluster tracks its own demand (freq = fmax*util/max_cap) up to fceil, so a
+ * heavy frame is never throttled into a util pile-up (the 96%-capped-Big bug:
+ * util couldn't drain -> 100% load, and misfit migration can't shed the
+ * overflow fast enough). The floor only covers a cold landing so a frame that
+ * lands on an idle-ish cluster recovers in fewer OPP steps; the envelope filter
+ * (not a static floor) holds the render clock between frames, so floors stay
+ * modest -- a high floor just pays voltage for the whole session. Frame (boost)
+ * floors stay high for real frame-miss recovery. */
 #define RFX_G_PRIME_FLOOR_PCT		72
 #define RFX_G_PRIME_FRAME_PCT		92
-/* Big banded to 2100-2400 (84-96% of a 2.5G A710); spikes spill to the uncapped
- * Prime via misfit migration, so Big never pegs. Prime = backup, no cap. */
-#define RFX_G_BIG_FLOOR_PCT		84
+#define RFX_G_BIG_FLOOR_PCT		66
 #define RFX_G_BIG_FRAME_PCT		90
-#define RFX_G_BIG_CAP_PCT		96
-/* Little pinned at max for compositor/input; <25% idle gate still releases it. */
-#define RFX_G_LITTLE_FLOOR_PCT		100
-#define RFX_G_LITTLE_FLOOR_BOOST_PCT	100
+/* Little (compositor/input/audio): demand-tracked floor, not pinned max --
+ * ~30-40% during play, so pinning 100% was pure heat. <25% idle gate releases. */
+#define RFX_G_LITTLE_FLOOR_PCT		60
+#define RFX_G_LITTLE_FLOOR_BOOST_PCT	80
 
 /* Max downward slew, percent of ceiling per ms elapsed (time-proportional,
  * not per-update, since update spacing varies with load). 1%/ms sheds a full
@@ -785,7 +784,7 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 	if (gaming) {
 		bool fboost_active, warmup_active;
 		unsigned int fboost_ramp_pct;
-		unsigned int fl, boost_fl, gcap, demand_pct;
+		unsigned int fl, boost_fl, demand_pct;
 		u64 down_step, slew_ns;
 
 		/*
@@ -844,15 +843,12 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 		if (prime) {
 			fl = rfx_pct(fceil, RFX_G_PRIME_FLOOR_PCT);
 			boost_fl = rfx_pct(fceil, RFX_G_PRIME_FRAME_PCT);
-			gcap = fceil;		/* backup: uncapped, absorbs spikes */
-		} else if (!little) {		/* Big: banded efficiency cluster */
+		} else if (!little) {		/* Big: demand-tracked, uncapped */
 			fl = rfx_pct(fceil, RFX_G_BIG_FLOOR_PCT);
 			boost_fl = rfx_pct(fceil, RFX_G_BIG_FRAME_PCT);
-			gcap = rfx_pct(fceil, RFX_G_BIG_CAP_PCT);
 		} else {			/* Little: compositor / audio / input */
 			fl = rfx_pct(fceil, RFX_G_LITTLE_FLOOR_PCT);
 			boost_fl = rfx_pct(fceil, RFX_G_LITTLE_FLOOR_BOOST_PCT);
-			gcap = fceil;		/* pinned max, no cap */
 		}
 
 		/*
@@ -941,10 +937,6 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 		if (little && p->little_ramp_end_ns && time < p->little_ramp_end_ns &&
 		    freq < boost_fl)
 			freq = boost_fl;
-
-		/* Big gaming band ceiling, applied last; no-op for Prime/Little. */
-		if (freq > gcap)
-			freq = gcap;
 	} else {
 		bool ui_active, coldstart_active;
 		unsigned int demand_pct;
