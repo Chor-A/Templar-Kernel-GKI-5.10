@@ -1,7 +1,7 @@
 /*
  * Author: andip71, 01.09.2017
  *
- * Version 1.1.0
+ * Version 1.2.0
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -16,6 +16,13 @@
 
 /*
  * Change log:
+ *
+ * 1.2.0 (2026-08-28)
+ *   - Curate default list for portability + safety across MTK/QCOM: drop
+ *     device-specific input/i2c/spi nodes (0-0028, event5, input5, spi0.0,
+ *     spi1.0) and RTC/timer sources (alarmtimer, [timerfd]) that risk missed
+ *     alarms and broken wake-on-input on other devices; add WLAN background
+ *     offload wakelocks (wlan_pno_wl, wlan_roam_wl, wlan_ipa).
  *
  * 1.1.0 (01.09.2017)
  *   - By default, the following wakelocks are blocked in an own list
