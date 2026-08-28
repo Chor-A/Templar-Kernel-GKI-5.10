@@ -1673,6 +1673,11 @@ static void rfx_reset_all_policies(void)
 		p->little_ramp_end_ns = 0;
 		p->prev_gaming_demand_pct = 0;
 		p->warmup_low_demand_since_ns = 0;
+		/* Daily latches: exit == fresh daily, no stale boost window. */
+		p->prev_upct = 0;
+		p->prev_upct_ns = 0;
+		p->ui_boost_end_ns = 0;
+		p->coldstart_boost_end_ns = 0;
 		/* Do not carry saturated gaming demand into the daily profile. */
 		p->filt_util = 0;
 		p->last_ema_ns = 0;
@@ -1702,6 +1707,9 @@ static ssize_t gaming_mode_store(struct gov_attr_set *attr_set,
 
 	if (!val) {
 		rfx_reset_all_policies();
+		/* Drop the 100ms gaming thermal poll back to idle rate. */
+		mod_delayed_work(system_wq, &rfx_thermal_work,
+				 msecs_to_jiffies(RFX_THERMAL_POLL_IDLE_MS));
 	} else {
 		struct rfx_policy *p;
 		unsigned long flags, pflags;
