@@ -1508,7 +1508,8 @@ static void rfx_thermal_fn(struct work_struct *w)
 		delay_ms = RFX_THERMAL_POLL_WARM_MS;
 	else
 		delay_ms = RFX_THERMAL_POLL_IDLE_MS;
-	schedule_delayed_work(&rfx_thermal_work, msecs_to_jiffies(delay_ms));
+	queue_delayed_work(system_power_efficient_wq, &rfx_thermal_work,
+			   msecs_to_jiffies(delay_ms));
 }
 
 /* ===================================================================== */
@@ -1708,7 +1709,7 @@ static ssize_t gaming_mode_store(struct gov_attr_set *attr_set,
 	if (!val) {
 		rfx_reset_all_policies();
 		/* Drop the 100ms gaming thermal poll back to idle rate. */
-		mod_delayed_work(system_wq, &rfx_thermal_work,
+		mod_delayed_work(system_power_efficient_wq, &rfx_thermal_work,
 				 msecs_to_jiffies(RFX_THERMAL_POLL_IDLE_MS));
 	} else {
 		struct rfx_policy *p;
@@ -1740,7 +1741,7 @@ static ssize_t gaming_mode_store(struct gov_attr_set *attr_set,
 		spin_unlock_irqrestore(&rfx_policy_list_lock, flags);
 
 		/* Sample temperature sooner once gaming begins. */
-		mod_delayed_work(system_wq, &rfx_thermal_work,
+		mod_delayed_work(system_power_efficient_wq, &rfx_thermal_work,
 				 msecs_to_jiffies(RFX_THERMAL_POLL_GAMING_MS));
 	}
 	return count;
@@ -2166,8 +2167,8 @@ static int __init vorpal_gov_init(void)
 		CPUFREQ_VORPAL_AUTHOR);
 
 	INIT_DEFERRABLE_WORK(&rfx_thermal_work, rfx_thermal_fn);
-	schedule_delayed_work(&rfx_thermal_work,
-			      msecs_to_jiffies(RFX_THERMAL_POLL_IDLE_MS));
+	queue_delayed_work(system_power_efficient_wq, &rfx_thermal_work,
+			   msecs_to_jiffies(RFX_THERMAL_POLL_IDLE_MS));
 
 	if (input_register_handler(&rfx_input_handler))
 		pr_warn("vorpal: input handler register failed (touch boost off)\n");
