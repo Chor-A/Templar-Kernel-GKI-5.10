@@ -39,6 +39,7 @@
 #include <linux/workqueue.h>
 #include <linux/atomic.h>
 #include <linux/list.h>
+#include <linux/suspend.h>
 #ifdef CONFIG_THERMAL
 #include <linux/thermal.h>
 #endif
@@ -94,21 +95,21 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  * the slew bound; 4ms (half a 120fps frame) * 1%/ms = 4% max step. */
 #define RFX_GAMING_DOWN_US		4000
 
-/* Gaming frequency band, percent of the effective ceiling. floor/frame gap
- * is what the clock hunts between frames; narrow band keeps inter-frame clock
- * high so a landing frame recovers in fewer OPP steps — needed at 120fps where
- * the 8.3ms budget can't absorb a wide recovery ramp. Frame (boost) floors
- * stay high for real frame-miss recovery. Prime 72: the envelope filter, not a
- * static floor, is what holds the render clock between frames, so this only has
- * to cover a cold landing. Raising it to 78 to fight the sawtooth just paid
- * ~2.3GHz of X2 voltage for the whole session. */
+/* Gaming floors, percent of the effective ceiling. NO cluster is capped: every
+ * cluster tracks its own demand (freq = fmax*util/max_cap) up to fceil, so a
+ * heavy frame is never throttled into a util pile-up (the 96%-capped-Big bug:
+ * util couldn't drain -> 100% load, and misfit migration can't shed the
+ * overflow fast enough). The floor only covers a cold landing so a frame that
+ * lands on an idle-ish cluster recovers in fewer OPP steps; the envelope filter
+ * (not a static floor) holds the render clock between frames, so floors stay
+ * modest -- a high floor just pays voltage for the whole session. Frame (boost)
+ * floors stay high for real frame-miss recovery. */
 #define RFX_G_PRIME_FLOOR_PCT		72
 #define RFX_G_PRIME_FRAME_PCT		92
 #define RFX_G_BIG_FLOOR_PCT		66
 #define RFX_G_BIG_FRAME_PCT		90
-/* Little at 60%: compositor, input and audio live here during gameplay at
- * ~30-40% demand; 60% holds the floor through inter-frame dips. Boost 80%
- * for frame-miss recovery. */
+/* Little (compositor/input/audio): demand-tracked floor, not pinned max --
+ * ~30-40% during play, so pinning 100% was pure heat. <25% idle gate releases. */
 #define RFX_G_LITTLE_FLOOR_PCT		60
 #define RFX_G_LITTLE_FLOOR_BOOST_PCT	80
 
@@ -200,25 +201,29 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  * real frame, so this only lowers the resting OPP. */
 #define RFX_HEADROOM_DAILY_HIGH		4
 #define RFX_HEADROOM_DAILY_MID		2
-/* Gaming headroom on top of the 25% margin. 8% (~33% total) is the steady-state
- * power lever -- applied every eval, so it sets the resting OPP. 10% pushed
- * average power off the 5.9W target for no FPS gain (heavy frames reach fmax via
- * the saturation shortcut regardless of headroom). */
-#define RFX_HEADROOM_GAMING		8
+/* Gaming headroom on top of the 25% margin. Applied every eval, so it sets the
+ * resting OPP -- the steady-state power lever. 8% (~33% total) kept the 70-85%
+ * game load pinned at fmax (measured 6.64W / 62.9% CPU): 72% real x1.25 margin
+ * = 90%, +8% = 98% >= the saturation trigger. 5% (~30% total) lets that band
+ * interpolate below the top OPP; heavy frames still reach fmax via the
+ * saturation shortcut regardless of headroom. */
+#define RFX_HEADROOM_GAMING		5
 
 /* Util percent at which we stop interpolating and request fmax outright.
- * Gaming 90%: with the envelope filter the reading is a scene measure rather
- * than a per-frame spike, so an early shortcut now buys fmax excursions for
- * frames that were not going to miss -- the 88 that was tuned against the
- * churning filter reads ~2 points hotter for no FPS. Heavy frames still reach
- * fmax; only the trigger point moved. Daily 95%: last OPP is a battery cost. */
-#define RFX_SAT_TO_MAX_GAMING_PCT	90
+ * Gaming 95%: at 90, every 70-85% frame (x1.25 margin -> 87-106% inflated)
+ * shortcut straight to fmax, pinning Big/Prime at the top OPP the whole session
+ * (the 7W / flat-2500 trace). 95 lets the 70-79% band interpolate down one or
+ * two OPPs; >=80% real demand still inflates past 95 and saturates, so heavy
+ * frames reach fmax unchanged -- only the resting point moved. The envelope
+ * filter makes the reading a scene measure, not a per-frame spike, so this does
+ * not chatter. Daily 95%: last OPP is a battery cost. */
+#define RFX_SAT_TO_MAX_GAMING_PCT	95
 #define RFX_SAT_TO_MAX_DAILY_PCT	95
 
-/* ---- Thermal emergency net. HW LMH + vendor HAL are the real controllers
- * (they lower policy->max, which the gaming band follows via fceil). This is a
- * single hard net for when the vendor engine is absent/asleep: one trip, one
- * release, 7C apart, so it cannot oscillate. */
+/* ---- Thermal emergency net. HW LMH (via thermal_pressure/fceil) + vendor HAL
+ * (via core-enforced policy->max) are the real controllers. This is a single
+ * hard net for when the vendor engine is absent/asleep: one trip, one release,
+ * 7C apart, so it cannot oscillate. */
 #define RFX_THERMAL_POLL_GAMING_MS	100
 /* Idle poll: die time constant is ~seconds; 5s detects runaway in <2 constants.
  * Work is deferrable (free in deep sleep), so this only trims screen-on-idle
@@ -348,7 +353,6 @@ struct rfx_tunables {
 	unsigned int rate_limit_us;
 	unsigned int up_rate_limit_us;
 	unsigned int down_rate_limit_us;
-	unsigned int gaming_mode;
 };
 
 struct rfx_policy {
@@ -469,27 +473,16 @@ static inline unsigned int rfx_pct(unsigned int fmax, unsigned int pct)
 }
 
 /*
- * Thermal headroom for this policy, 0..100. 100 = nothing holding the cluster
- * below its hardware ceiling. Two channels, since platforms disagree on which:
- *   policy->max  - lowered via freq_qos by cpufreq_cooling / vendor thermal /
- *                  userspace HAL. What MediaTek and most AOSP/OOS stacks drive.
- *   thermal      - arch_scale_thermal_pressure(): capacity taken away, incl. by
- *   pressure       HW limiters (QCOM LMH) that throttle WITHOUT touching
- *                  policy->max, so the policy over-claims its ceiling.
- * min() is not a double count: cpufreq_cooling derives both from the same
- * requested freq, so when both are live they agree and min() is a no-op; when
- * only one is live, min() is the only way to see it.
+ * Thermal headroom 0..100, from thermal_pressure only (LMH-style throttle the
+ * core can't see). policy->max is NOT folded in -- the core enforces it on
+ * commit, and a non-thermal baseline below fmax (MTK) would compound with the
+ * % caps and halve the usable range.
  */
 static unsigned int rfx_thermal_headroom_pct(struct cpufreq_policy *pol,
 					     unsigned long max_cap)
 {
-	unsigned int fmax = pol->cpuinfo.max_freq;
-	unsigned int pmax = READ_ONCE(pol->max);
-	unsigned int qos_pct = 100, press_pct = 100;
+	unsigned int press_pct = 100;
 	unsigned long press;
-
-	if (fmax && pmax && pmax < fmax)
-		qos_pct = (unsigned int)((u64)pmax * 100 / fmax);
 
 	press = arch_scale_thermal_pressure(cpumask_first(pol->related_cpus));
 	if (max_cap) {
@@ -500,7 +493,7 @@ static unsigned int rfx_thermal_headroom_pct(struct cpufreq_policy *pol,
 						   100 / max_cap);
 	}
 
-	return min(qos_pct, press_pct);
+	return press_pct;
 }
 
 /*
@@ -667,9 +660,9 @@ static unsigned long rfx_apply_headroom(unsigned long util, unsigned long max_ca
 /*
  * Last clamp before OPP resolution. A flat, latched cap - no walking, no
  * proportional target, no per-cluster stepping. Normal throttling is the
- * platform's job (LMH / thermal HAL lower policy->max, and the gaming band
- * tracks that through fceil); this only fires if the die reaches
- * RFX_TEMP_EMERGENCY_MC, which on a healthy device never happens.
+ * platform's job (LMH via thermal_pressure/fceil, thermal HAL via core-enforced
+ * policy->max); this only fires if the die reaches RFX_TEMP_EMERGENCY_MC, which
+ * on a healthy device never happens.
  */
 static unsigned int rfx_thermal_clamp(unsigned int freq, unsigned int fmax)
 {
@@ -854,7 +847,7 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 		if (prime) {
 			fl = rfx_pct(fceil, RFX_G_PRIME_FLOOR_PCT);
 			boost_fl = rfx_pct(fceil, RFX_G_PRIME_FRAME_PCT);
-		} else if (!little) {		/* Big: carries most load */
+		} else if (!little) {		/* Big: demand-tracked, uncapped */
 			fl = rfx_pct(fceil, RFX_G_BIG_FLOOR_PCT);
 			boost_fl = rfx_pct(fceil, RFX_G_BIG_FRAME_PCT);
 		} else {			/* Little: compositor / audio / input */
@@ -1515,7 +1508,8 @@ static void rfx_thermal_fn(struct work_struct *w)
 		delay_ms = RFX_THERMAL_POLL_WARM_MS;
 	else
 		delay_ms = RFX_THERMAL_POLL_IDLE_MS;
-	schedule_delayed_work(&rfx_thermal_work, msecs_to_jiffies(delay_ms));
+	queue_delayed_work(system_power_efficient_wq, &rfx_thermal_work,
+			   msecs_to_jiffies(delay_ms));
 }
 
 /* ===================================================================== */
@@ -1680,6 +1674,11 @@ static void rfx_reset_all_policies(void)
 		p->little_ramp_end_ns = 0;
 		p->prev_gaming_demand_pct = 0;
 		p->warmup_low_demand_since_ns = 0;
+		/* Daily latches: exit == fresh daily, no stale boost window. */
+		p->prev_upct = 0;
+		p->prev_upct_ns = 0;
+		p->ui_boost_end_ns = 0;
+		p->coldstart_boost_end_ns = 0;
 		/* Do not carry saturated gaming demand into the daily profile. */
 		p->filt_util = 0;
 		p->last_ema_ns = 0;
@@ -1691,12 +1690,11 @@ static void rfx_reset_all_policies(void)
 
 static ssize_t gaming_mode_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n", to_rfx_tunables(attr_set)->gaming_mode);
+	return sprintf(buf, "%u\n", rfx_gaming_enabled());
 }
 static ssize_t gaming_mode_store(struct gov_attr_set *attr_set,
 				 const char *buf, size_t count)
 {
-	struct rfx_tunables *t = to_rfx_tunables(attr_set);
 	unsigned int val;
 
 	if (kstrtouint(buf, 10, &val))
@@ -1704,11 +1702,13 @@ static ssize_t gaming_mode_store(struct gov_attr_set *attr_set,
 	if (val > 1)
 		return -EINVAL;
 
-	t->gaming_mode = val;
 	atomic_set(&rfx_gaming, val);
 
 	if (!val) {
 		rfx_reset_all_policies();
+		/* Drop the 100ms gaming thermal poll back to idle rate. */
+		mod_delayed_work(system_power_efficient_wq, &rfx_thermal_work,
+				 msecs_to_jiffies(RFX_THERMAL_POLL_IDLE_MS));
 	} else {
 		struct rfx_policy *p;
 		unsigned long flags, pflags;
@@ -1739,7 +1739,7 @@ static ssize_t gaming_mode_store(struct gov_attr_set *attr_set,
 		spin_unlock_irqrestore(&rfx_policy_list_lock, flags);
 
 		/* Sample temperature sooner once gaming begins. */
-		mod_delayed_work(system_wq, &rfx_thermal_work,
+		mod_delayed_work(system_power_efficient_wq, &rfx_thermal_work,
 				 msecs_to_jiffies(RFX_THERMAL_POLL_GAMING_MS));
 	}
 	return count;
@@ -2157,6 +2157,33 @@ struct cpufreq_governor *cpufreq_default_governor(void)
 }
 #endif
 
+/* ===================================================================== */
+/* PM notifier — gaming must not survive into suspend                    */
+/* ===================================================================== */
+
+/*
+ * gaming_mode has no auto-clear: a game tool sets it, and if userspace never
+ * writes 0 the mode is sticky. Entering autosleep still latched then strands
+ * Big/Prime at the gaming idle floor (RFX_G_IDLE_FLOOR_PCT) with 250us eval on
+ * every post-suspend wake -- the "CPU6/7 busy in deep sleep" drain. Screen off
+ * is never gaming, so clear it here; a game daemon re-arms on resume.
+ */
+static int rfx_pm_notify(struct notifier_block *nb, unsigned long action,
+			 void *unused)
+{
+	if (action == PM_SUSPEND_PREPARE && rfx_gaming_enabled()) {
+		atomic_set(&rfx_gaming, 0);
+		rfx_reset_all_policies();
+		mod_delayed_work(system_power_efficient_wq, &rfx_thermal_work,
+				 msecs_to_jiffies(RFX_THERMAL_POLL_IDLE_MS));
+	}
+	return NOTIFY_OK;
+}
+
+static struct notifier_block rfx_pm_nb = {
+	.notifier_call = rfx_pm_notify,
+};
+
 static int __init vorpal_gov_init(void)
 {
 	int ret;
@@ -2165,14 +2192,17 @@ static int __init vorpal_gov_init(void)
 		CPUFREQ_VORPAL_AUTHOR);
 
 	INIT_DEFERRABLE_WORK(&rfx_thermal_work, rfx_thermal_fn);
-	schedule_delayed_work(&rfx_thermal_work,
-			      msecs_to_jiffies(RFX_THERMAL_POLL_IDLE_MS));
+	queue_delayed_work(system_power_efficient_wq, &rfx_thermal_work,
+			   msecs_to_jiffies(RFX_THERMAL_POLL_IDLE_MS));
 
 	if (input_register_handler(&rfx_input_handler))
 		pr_warn("vorpal: input handler register failed (touch boost off)\n");
 
+	register_pm_notifier(&rfx_pm_nb);
+
 	ret = cpufreq_register_governor(&vorpal_gov);
 	if (ret) {
+		unregister_pm_notifier(&rfx_pm_nb);
 		input_unregister_handler(&rfx_input_handler);
 		cancel_delayed_work_sync(&rfx_thermal_work);
 	}
@@ -2182,6 +2212,7 @@ static int __init vorpal_gov_init(void)
 static void __exit vorpal_gov_exit(void)
 {
 	cpufreq_unregister_governor(&vorpal_gov);
+	unregister_pm_notifier(&rfx_pm_nb);
 	input_unregister_handler(&rfx_input_handler);
 	cancel_delayed_work_sync(&rfx_thermal_work);
 }
