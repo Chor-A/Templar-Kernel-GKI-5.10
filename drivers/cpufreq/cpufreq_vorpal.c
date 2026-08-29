@@ -39,6 +39,7 @@
 #include <linux/workqueue.h>
 #include <linux/atomic.h>
 #include <linux/list.h>
+#include <linux/suspend.h>
 #ifdef CONFIG_THERMAL
 #include <linux/thermal.h>
 #endif
@@ -352,7 +353,6 @@ struct rfx_tunables {
 	unsigned int rate_limit_us;
 	unsigned int up_rate_limit_us;
 	unsigned int down_rate_limit_us;
-	unsigned int gaming_mode;
 };
 
 struct rfx_policy {
@@ -1690,12 +1690,11 @@ static void rfx_reset_all_policies(void)
 
 static ssize_t gaming_mode_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n", to_rfx_tunables(attr_set)->gaming_mode);
+	return sprintf(buf, "%u\n", rfx_gaming_enabled());
 }
 static ssize_t gaming_mode_store(struct gov_attr_set *attr_set,
 				 const char *buf, size_t count)
 {
-	struct rfx_tunables *t = to_rfx_tunables(attr_set);
 	unsigned int val;
 
 	if (kstrtouint(buf, 10, &val))
@@ -1703,7 +1702,6 @@ static ssize_t gaming_mode_store(struct gov_attr_set *attr_set,
 	if (val > 1)
 		return -EINVAL;
 
-	t->gaming_mode = val;
 	atomic_set(&rfx_gaming, val);
 
 	if (!val) {
@@ -2159,6 +2157,33 @@ struct cpufreq_governor *cpufreq_default_governor(void)
 }
 #endif
 
+/* ===================================================================== */
+/* PM notifier — gaming must not survive into suspend                    */
+/* ===================================================================== */
+
+/*
+ * gaming_mode has no auto-clear: a game tool sets it, and if userspace never
+ * writes 0 the mode is sticky. Entering autosleep still latched then strands
+ * Big/Prime at the gaming idle floor (RFX_G_IDLE_FLOOR_PCT) with 250us eval on
+ * every post-suspend wake -- the "CPU6/7 busy in deep sleep" drain. Screen off
+ * is never gaming, so clear it here; a game daemon re-arms on resume.
+ */
+static int rfx_pm_notify(struct notifier_block *nb, unsigned long action,
+			 void *unused)
+{
+	if (action == PM_SUSPEND_PREPARE && rfx_gaming_enabled()) {
+		atomic_set(&rfx_gaming, 0);
+		rfx_reset_all_policies();
+		mod_delayed_work(system_power_efficient_wq, &rfx_thermal_work,
+				 msecs_to_jiffies(RFX_THERMAL_POLL_IDLE_MS));
+	}
+	return NOTIFY_OK;
+}
+
+static struct notifier_block rfx_pm_nb = {
+	.notifier_call = rfx_pm_notify,
+};
+
 static int __init vorpal_gov_init(void)
 {
 	int ret;
@@ -2173,8 +2198,11 @@ static int __init vorpal_gov_init(void)
 	if (input_register_handler(&rfx_input_handler))
 		pr_warn("vorpal: input handler register failed (touch boost off)\n");
 
+	register_pm_notifier(&rfx_pm_nb);
+
 	ret = cpufreq_register_governor(&vorpal_gov);
 	if (ret) {
+		unregister_pm_notifier(&rfx_pm_nb);
 		input_unregister_handler(&rfx_input_handler);
 		cancel_delayed_work_sync(&rfx_thermal_work);
 	}
@@ -2184,6 +2212,7 @@ static int __init vorpal_gov_init(void)
 static void __exit vorpal_gov_exit(void)
 {
 	cpufreq_unregister_governor(&vorpal_gov);
+	unregister_pm_notifier(&rfx_pm_nb);
 	input_unregister_handler(&rfx_input_handler);
 	cancel_delayed_work_sync(&rfx_thermal_work);
 }
