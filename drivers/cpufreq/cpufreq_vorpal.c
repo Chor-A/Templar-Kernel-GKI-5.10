@@ -103,10 +103,16 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  * lands on an idle-ish cluster recovers in fewer OPP steps; the envelope filter
  * (not a static floor) holds the render clock between frames, so floors stay
  * modest -- a high floor just pays voltage for the whole session. Frame (boost)
- * floors stay high for real frame-miss recovery. */
-#define RFX_G_PRIME_FLOOR_PCT		72
+ * floors stay high for real frame-miss recovery.
+ *
+ * These two are the gaming resting-power dial (avg CPU / watts): a heavy frame
+ * still reaches fmax via the saturation shortcut regardless of the floor, so
+ * cutting them only lowers the light/normal-frame resting OPP, not the FPS
+ * ceiling. Lowered 72->64 / 66->58 to land avg CPU in the 50s and power <6W;
+ * drop further (toward 58/52) only if power is still high AND 120fps holds. */
+#define RFX_G_PRIME_FLOOR_PCT		64
 #define RFX_G_PRIME_FRAME_PCT		92
-#define RFX_G_BIG_FLOOR_PCT		66
+#define RFX_G_BIG_FLOOR_PCT		58
 #define RFX_G_BIG_FRAME_PCT		90
 /* Little (compositor/input/audio): demand-tracked floor, not pinned max --
  * ~30-40% during play, so pinning 100% was pure heat. <25% idle gate releases. */
@@ -138,8 +144,17 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  * Daily Big/Prime caps keep unperceived background work off the top OPPs. A
  * touch/UI window lifts to *_BOOST_CAP_PCT; the sustained latch (>=LIFT_PCT,
  * released below DROP_PCT) lifts to *_SUSTAINED_CAP_PCT for long foreground
- * work. Prime's boost cap is deliberately flat at its base, so its sustained
- * cap stays modest too -- the X2's top OPPs are the daily power cliff.
+ * work. Prime's boost cap is deliberately flat at its base, so bursty daily
+ * work never touches the top OPPs -- the X2's top OPPs are the power cliff.
+ *
+ * The SUSTAINED caps are the benchmark/heavy-compute ceiling (Geekbench runs in
+ * daily mode: gaming_mode is never auto-written). The latch only engages at
+ * sustained real demand >=~52%, i.e. benchmark/compile/export -- never the idle
+ * or light-active daily paths that own the battery targets -- so these can sit
+ * high without a daily-power cost. Prime 75->85 (single-core: 75% pinned SC to
+ * ~1677; 85% clears 1700++), Big 88->94 (multi-core: clears 4500++). Higher
+ * clock here is also race-to-idle. Trim if a sustained-load thermal ceiling
+ * appears before the benchmark completes.
  */
 #define RFX_D_BIG_CAP_PCT		70
 #define RFX_D_BIG_BOOST_CAP_PCT		80
@@ -147,8 +162,8 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
 #define RFX_D_PRIME_BOOST_CAP_PCT	68
 #define RFX_D_BIG_LIFT_PCT		65
 #define RFX_D_BIG_DROP_PCT		55
-#define RFX_D_BIG_SUSTAINED_CAP_PCT	88
-#define RFX_D_PRIME_SUSTAINED_CAP_PCT	75
+#define RFX_D_BIG_SUSTAINED_CAP_PCT	94
+#define RFX_D_PRIME_SUSTAINED_CAP_PCT	85
 
 /* Cold-start burst floors, clamped to cap. Cover the first ~2ms of an app
  * launch until real demand is visible (200ms window). */
