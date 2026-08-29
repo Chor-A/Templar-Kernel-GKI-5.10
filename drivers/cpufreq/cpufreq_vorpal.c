@@ -217,22 +217,29 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
 #define RFX_HEADROOM_DAILY_HIGH		4
 #define RFX_HEADROOM_DAILY_MID		2
 /* Gaming headroom on top of the 25% margin. Applied every eval, so it sets the
- * resting OPP -- the steady-state power lever. 8% (~33% total) kept the 70-85%
- * game load pinned at fmax (measured 6.64W / 62.9% CPU): 72% real x1.25 margin
- * = 90%, +8% = 98% >= the saturation trigger. 5% (~30% total) lets that band
- * interpolate below the top OPP; heavy frames still reach fmax via the
- * saturation shortcut regardless of headroom. */
-#define RFX_HEADROOM_GAMING		5
+ * resting OPP -- the steady-state power lever. On-device trace (Garena, SD7+G2)
+ * showed 5% still pinned Big flat at fmax the whole session at 70-80% real load
+ * (6.66W / 60.9% avg CPU) while FPS stayed engine-bound at ~117 -- i.e. the top
+ * OPP bought heat, not frames. 2% (~27% total) lets the sustained 70-80% scene
+ * interpolate one-two OPPs below fmax; a real >=78% frame still inflates past
+ * the saturation trigger and reaches fmax, and the independent frame-risk
+ * detector (RFX_RISK_SATURATION_PCT) still boosts genuine misses, so FPS holds
+ * while resting watts drop. Do not raise back toward 5+ without a fresh trace
+ * showing FPS (not just CPU%) actually falling. */
+#define RFX_HEADROOM_GAMING		2
 
 /* Util percent at which we stop interpolating and request fmax outright.
- * Gaming 95%: at 90, every 70-85% frame (x1.25 margin -> 87-106% inflated)
- * shortcut straight to fmax, pinning Big/Prime at the top OPP the whole session
- * (the 7W / flat-2500 trace). 95 lets the 70-79% band interpolate down one or
- * two OPPs; >=80% real demand still inflates past 95 and saturates, so heavy
- * frames reach fmax unchanged -- only the resting point moved. The envelope
+ * Gaming 98%: the on-device trace showed 95 still shortcut the sustained
+ * 70-80% render load to fmax (76% real x1.25 margin = 95 == trigger), pinning
+ * Big/Little flat at the top OPP for the whole session while FPS stayed
+ * engine-bound at ~117 -- clock that bought heat, not frames. 98 lets the
+ * 70-78% real band (inflated 87-97) ride one-two OPPs down the table instead of
+ * pinning; only >=78.4% real still inflates to >=98 and saturates, so genuinely
+ * heavy frames reach fmax unchanged and the frame-risk detector still covers
+ * misses -- only the resting point of a steady heavy scene moved. The envelope
  * filter makes the reading a scene measure, not a per-frame spike, so this does
  * not chatter. Daily 95%: last OPP is a battery cost. */
-#define RFX_SAT_TO_MAX_GAMING_PCT	95
+#define RFX_SAT_TO_MAX_GAMING_PCT	98
 #define RFX_SAT_TO_MAX_DAILY_PCT	95
 
 /* ---- Thermal emergency net. HW LMH (via thermal_pressure/fceil) + vendor HAL
